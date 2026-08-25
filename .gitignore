@@ -1,0 +1,38 @@
+# Auto Waste Bin — Git Ignore Rules
+# ============================================================
+# ⚠️  NEVER commit secrets.h files — they contain credentials!
+# ============================================================
+
+# Credentials & environment files
+**/secrets.h
+.env
+*.env
+
+# Chrome debug profile & temporary scraping data
+**/chrome_debug_profile/
+**/debug_frames/
+*.jpg
+*.jpeg
+*.png
+temp_web_frame.jpg
+
+# Python cache & virtual environments
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+env/
+
+# Arduino build artifacts
+build/
+*.bin
+*.elf
+*.map
+
+# OS & IDE files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
