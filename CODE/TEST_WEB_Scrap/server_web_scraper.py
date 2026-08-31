@@ -63,17 +63,43 @@ PROMPTS = {
         "WAITING - person still holding waste. "
         "Respond ONLY with raw JSON: "
         "{\"detection\": \"EMPTY_ARM\"} or {\"detection\": \"BACK_TURNED\"} or {\"detection\": \"WAITING\"}"
+    ),
+    5: (
+        "You are the vision system of an autonomous waste bin robot. "
+        "The robot stopped because an obstacle is detected directly in front while approaching a person. "
+        "Determine if the obstacle directly ahead IS THE TARGET PERSON (person extending arm/holding waste, person waiting to deposit trash, person close up) "
+        "OR AN UNRELATED BLOCKING OBSTACLE (wall, chair, table, box, door, bystander not interacting). "
+        "Respond ONLY with raw JSON: "
+        "{\"detection\": \"IS_TARGET\"} or {\"detection\": \"IS_OBSTACLE\"} or {\"detection\": \"NONE\"}"
     )
 }
 
 # State variables
 latest_frame = None
+last_frame_ts = None
 latest_result = {"detection": "NONE", "bbox_center_x": 160}
 latest_latency = {"net_kb": 0, "gemini_s": 0.0, "total_s": 0.0}
 latest_prompt = "Waiting for first frame..."
 latest_raw_response = "Waiting for Gemini web output..."
 latest_error = ""
 stats = {"total_frames": 0, "detections": 0, "errors": 0}
+
+def create_placeholder_jpeg():
+    try:
+        from PIL import Image, ImageDraw
+        img = Image.new('RGB', (320, 240), color=(30, 41, 59))
+        d = ImageDraw.Draw(img)
+        d.text((45, 100), "Waiting for ESP32-CAM frame...", fill=(148, 163, 184))
+        d.text((30, 130), "POST http://<laptop_ip>:5000/process_frame", fill=(100, 116, 139))
+        import io
+        buf = io.BytesIO()
+        img.save(buf, format='JPEG')
+        return buf.getvalue()
+    except Exception:
+        # Minimal valid 1x1 JPEG fallback
+        return b'\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x01\x00H\x00H\x00\x00\xff\xdb\x00C\x00\x08\x06\x06\x07\x06\x05\x08\x07\x07\x07\t\t\x08\n\x0c\x14\r\x0c\x0b\x0b\x0c\x19\x12\x13\x0f\x14\x1d\x1a\x1f\x1e\x1d\x1a\x1c\x1c $.\' ",#\x1c\x1c(7),01444\x1f\'9=82<.342\xff\xc0\x00\x0b\x08\x00\x01\x00\x01\x01\x01\x11\x00\xff\xc4\x00\x1f\x00\x00\x01\x05\x01\x01\x01\x01\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x01\x02\x03\x04\x05\x06\x07\x08\t\n\x0b\xff\xda\x00\x08\x01\x01\x00\x00?\x00\xbf\x00\xff\xd9'
+
+PLACEHOLDER_FRAME = create_placeholder_jpeg()
 
 driver = None
 driver_lock = threading.Lock()
@@ -142,19 +168,22 @@ def query_gemini_web(image_path: str, prompt_text: str):
             else:
                 print("⚠ Warning: Image upload input not found on page.")
 
-            # 2. Locate the prompt input box
+            # 2. Locate the prompt input box and insert prompt text instantly
             text_boxes = driver.find_elements(By.CSS_SELECTOR, "div[role='textbox'], rich-textarea p, textarea")
             if not text_boxes:
                 raise Exception("Gemini prompt input box not found on page.")
             
             box = text_boxes[0]
             try:
-                driver.execute_script("arguments[0].focus();", box)
+                driver.execute_script("""
+                    arguments[0].focus();
+                    document.execCommand('selectAll', false, null);
+                    document.execCommand('insertText', false, arguments[1]);
+                """, box, prompt_text)
             except Exception:
-                pass
-            box.click()
-            box.send_keys(prompt_text)
-            time.sleep(0.4)
+                box.click()
+                box.send_keys(prompt_text)
+            time.sleep(0.3)
             
             # Click Send button or send Enter key
             send_btns = driver.find_elements(By.CSS_SELECTOR, "button[aria-label*='Send'], button[aria-label*='send'], button.send-button")
@@ -169,8 +198,7 @@ def query_gemini_web(image_path: str, prompt_text: str):
                 box.send_keys(Keys.ENTER)
 
             # 3. Wait for the generation to finish
-            # Track response elements until the streaming indicator disappears
-            time.sleep(1.2)
+            time.sleep(1.0)
             max_wait = 25
             start_wait = time.time()
             raw_text = ""
@@ -225,6 +253,10 @@ def query_gemini_web(image_path: str, prompt_text: str):
                 return {"detection": "EMPTY_ARM"}, gemini_dur, raw_text, ""
             elif "BACK_TURNED" in raw_text:
                 return {"detection": "BACK_TURNED"}, gemini_dur, raw_text, ""
+            elif "IS_TARGET" in raw_text:
+                return {"detection": "IS_TARGET"}, gemini_dur, raw_text, ""
+            elif "IS_OBSTACLE" in raw_text:
+                return {"detection": "IS_OBSTACLE"}, gemini_dur, raw_text, ""
             elif "TRACKING" in raw_text:
                 return {"detection": "TRACKING", "bbox_center_x": 160}, gemini_dur, raw_text, ""
             elif "NONE" in raw_text:
@@ -239,7 +271,7 @@ def query_gemini_web(image_path: str, prompt_text: str):
 
 @app.route('/process_frame', methods=['POST'])
 def process_frame():
-    global latest_frame, latest_result, latest_latency, latest_prompt, latest_raw_response, stats
+    global latest_frame, last_frame_ts, latest_result, latest_latency, latest_prompt, latest_raw_response, stats
     t_start = time.time()
     
     image_bytes = request.get_data()
@@ -250,12 +282,15 @@ def process_frame():
     is_preview = request.args.get('preview', default=0, type=int)
     
     latest_frame = image_bytes
+    last_frame_ts = time.time()
     frame_kb = len(image_bytes) / 1024.0
     stats["total_frames"] += 1
     
     # If preview frame, do not send to Gemini chat
     if is_preview:
         return jsonify({"status": "preview_ok", "detection": "NONE"})
+        
+    print(f"📥 POST /process_frame from {request.remote_addr} ({frame_kb:.1f} KB, state={state_code})")
         
     # Assign system prompt for current vision state
     prompt = PROMPTS.get(state_code, PROMPTS[0])
@@ -303,7 +338,7 @@ def process_frame():
 def get_latest_frame():
     if latest_frame is not None:
         return Response(latest_frame, mimetype='image/jpeg', headers={'Cache-Control': 'no-cache, no-store, must-revalidate'})
-    return Response(b'', status=404)
+    return Response(PLACEHOLDER_FRAME, mimetype='image/jpeg', headers={'Cache-Control': 'no-cache, no-store, must-revalidate'})
 
 @app.route('/video_feed')
 def video_feed():
@@ -342,22 +377,27 @@ def index():
             @media(max-width: 768px) {{ .two-col {{ grid-template-columns: 1fr; }} }}
         </style>
         <script>
-            function refreshFeed() {{
-                const img = document.getElementById('camera-img');
-                img.src = '/latest_frame.jpg?t=' + new Date().getTime();
-            }}
-            setInterval(refreshFeed, 300);
-
+            let lastFrameTs = 0;
             setInterval(() => {{
                 fetch('/api/status').then(r => r.json()).then(d => {{
+                    if (!d) return;
                     document.getElementById('det-val').innerText = d.result.detection || 'NONE';
                     document.getElementById('bbox-val').innerText = d.result.bbox_center_x !== undefined ? d.result.bbox_center_x : '--';
-                    document.getElementById('gem-lat').innerText = d.latency.gemini_s + ' s';
-                    document.getElementById('tot-lat').innerText = d.latency.total_s + ' s';
+                    document.getElementById('gem-lat').innerText = (d.latency.gemini_s || 0) + ' s';
+                    document.getElementById('tot-lat').innerText = (d.latency.total_s || 0) + ' s';
                     document.getElementById('tot-frames').innerText = d.stats.total_frames;
                     document.getElementById('tot-dets').innerText = d.stats.detections;
-                    document.getElementById('prompt-view').innerText = d.prompt;
-                    document.getElementById('resp-view').innerText = d.raw_response;
+                    document.getElementById('prompt-view').innerText = d.prompt || '';
+                    document.getElementById('resp-view').innerText = d.raw_response || '';
+
+                    // Only reload the image when a fresh frame arrives
+                    if (d.seconds_since_last_frame !== null && d.seconds_since_last_frame < 15) {{
+                        let ts = Math.floor(d.seconds_since_last_frame);
+                        if (ts !== lastFrameTs) {{
+                            lastFrameTs = ts;
+                            document.getElementById('camera-img').src = '/latest_frame.jpg?t=' + Date.now();
+                        }}
+                    }}
 
                     let errEl = document.getElementById('err-banner');
                     if (d.error && d.error.length > 0) {{
@@ -366,8 +406,8 @@ def index():
                     }} else {{
                         errEl.style.display = 'none';
                     }}
-                }});
-            }}, 600);
+                }}).catch(() => {{}});
+            }}, 1000);
         </script>
     </head>
     <body>
@@ -438,13 +478,15 @@ def index():
 
 @app.route('/api/status')
 def api_status():
+    sec_since_frame = round(time.time() - last_frame_ts, 1) if last_frame_ts else None
     return jsonify({
         "result": latest_result,
         "latency": latest_latency,
         "stats": stats,
         "prompt": latest_prompt,
         "raw_response": latest_raw_response,
-        "error": latest_error
+        "error": latest_error,
+        "seconds_since_last_frame": sec_since_frame
     })
 
 if __name__ == '__main__':
@@ -455,6 +497,9 @@ if __name__ == '__main__':
     print(f" 💻 Laptop Local IP Address : {local_ip}")
     print(f" 📡 ESP32-CAM Target URL    : http://{local_ip}:{PORT}/process_frame")
     print(f" 🌐 Web Visual Dashboard    : http://localhost:{PORT}")
+    print("=" * 65)
+    print(" 💡 TIP: If ESP32-CAM cannot connect, allow port 5000 in PowerShell:")
+    print("    New-NetFirewallRule -DisplayName \"WasteBinVisionServer\" -Direction Inbound -LocalPort 5000 -Protocol TCP -Action Allow -Profile Any")
     print("=" * 65)
     print(" Initializing Chrome connection...")
     init_selenium_browser()

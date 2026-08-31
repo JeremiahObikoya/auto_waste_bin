@@ -16,8 +16,8 @@
 #define LAPTOP_IP       "192.168.1.100" // Replace with your laptop Wi-Fi IP
 #define LAPTOP_PORT     5000
 
-// --- Main ESP32 Navigation Node MAC Address ---
-// Default: {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF} (Broadcast)
-static const uint8_t MAIN_ESP32_MAC[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+// --- UDP Ports for ESP32 <-> ESP32-CAM Wi-Fi Router Communication ---
+#define UDP_MAIN_RX_PORT 8888
+#define UDP_CAM_RX_PORT  8889
 
 #endif // SECRETS_H

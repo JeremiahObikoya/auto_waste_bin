@@ -1,0 +1,9 @@
+Optional (Run Once as Administrator in PowerShell if ESP32-CAM cannot connect to server):
+New-NetFirewallRule -DisplayName "WasteBinVisionServer" -Direction Inbound -LocalPort 5000 -Protocol TCP -Action Allow -Profile Any
+
+Command 1 (Launch Chrome with Gemini):
+cd "c:\Users\Jeremy\Desktop\SCHOOL ACTIVITIES\500 level\Final_Year_Project\Auto_Waste_Bin\CODE\TEST_WEB_Scrap"
+.\launch_chrome.bat
+
+Command 2 (Start Middleman Python Server):
+python server_web_scraper.py

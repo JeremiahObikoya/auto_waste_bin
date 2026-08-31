@@ -12,11 +12,12 @@
 #define AP_SSID         "Auto_Waste_Bin_AP"
 #define AP_PASSWORD     "12345678"
 
-// --- ESP32-CAM MAC Address ---
-// Default: {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF} (Broadcast)
-#define ESPCAM_MAC      {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}
+// --- Home / Router Wi-Fi Credentials (same as ESP32-CAM) ---
+#define WIFI_SSID       "YOUR_WIFI_SSID"
+#define WIFI_PASSWORD   "YOUR_WIFI_PASSWORD"
 
-// --- ESP-NOW Channel ---
-#define ESPNOW_CHANNEL  1
+// --- UDP Ports for ESP32 <-> ESP32-CAM Wi-Fi Router Communication ---
+#define UDP_MAIN_RX_PORT 8888
+#define UDP_CAM_RX_PORT  8889
 
 #endif // SECRETS_H

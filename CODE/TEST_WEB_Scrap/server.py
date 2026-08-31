@@ -53,6 +53,14 @@ PROMPTS = {
         "WAITING - person still holding waste. "
         "Respond ONLY with raw JSON: "
         "{\"detection\": \"EMPTY_ARM\"} or {\"detection\": \"BACK_TURNED\"} or {\"detection\": \"WAITING\"}"
+    ),
+    5: (  # OBSTACLE_CHECK (Target vs Obstacle Verification)
+        "You are the vision system of an autonomous waste bin robot. "
+        "The robot stopped because an obstacle is detected directly in front while approaching a person. "
+        "Determine if the obstacle directly ahead IS THE TARGET PERSON (person extending arm/holding waste, person waiting to deposit trash, person close up) "
+        "OR AN UNRELATED BLOCKING OBSTACLE (wall, chair, table, box, door, bystander not interacting). "
+        "Respond ONLY with raw JSON: "
+        "{\"detection\": \"IS_TARGET\"} or {\"detection\": \"IS_OBSTACLE\"} or {\"detection\": \"NONE\"}"
     )
 }
 
@@ -136,6 +144,10 @@ def query_gemini_rest(image_bytes: bytes, prompt_text: str):
                     return {"detection": "EMPTY_ARM"}, gemini_dur, raw_text, ""
                 elif "BACK_TURNED" in raw_text:
                     return {"detection": "BACK_TURNED"}, gemini_dur, raw_text, ""
+                elif "IS_TARGET" in raw_text:
+                    return {"detection": "IS_TARGET"}, gemini_dur, raw_text, ""
+                elif "IS_OBSTACLE" in raw_text:
+                    return {"detection": "IS_OBSTACLE"}, gemini_dur, raw_text, ""
                 elif "TRACKING" in raw_text:
                     return {"detection": "TRACKING", "bbox_center_x": 160}, gemini_dur, raw_text, ""
                 else:

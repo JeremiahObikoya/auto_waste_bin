@@ -1,0 +1,63 @@
+Searched for "currentYaw"
+Ran command: `findstr /n "currentYaw\|resetYaw\|calibrate\|yaw\|Yaw\|YAW\|lastSampleUs\|gyroZ_offset" esp_main.ino`
+Ran command: `Select-String -Path "esp_main.ino" -Pattern "currentYaw|resetYaw|calibrate|lastSampleUs|gyroZ_offset|reset.*yaw|yaw.*reset" -CaseSensitive:$false | Select-Object LineNumber, Line`
+Viewed esp_main.ino:1743-1755
+
+Found the root cause. Let me verify the `lastSampleUs` initialization and the first-call dt spike:
+
+Viewed esp_main.ino:1885-1940
+
+Now I have the complete picture. This is **a code bug** — a specific one. Here's exactly what's happening:
+
+---
+
+### The Real Bug — Bad Calibration Offset at Boot
+
+Look at `setup()`:
+```
+Line 1897: calibrateMPU();   ← runs during boot, takes ~900ms (300 × 3ms)
+Line 1901: WiFi.begin(...)   ← WiFi stack starts
+...
+Line 1931: lastSampleUs = micros();  ← only set AFTER all setup is done (could be 10+ seconds later)
+```
+
+The **calibration runs during boot while Wi-Fi hasn't started yet** — so the board is completely cold. When the robot is picked up, placed on the table, or even breathed on during that 900ms window, the measured offset is **wrong**.
+
+The result: `gyroZ_offset` is miscalibrated by e.g. `0.09 rad/s` = `5°/s`. The deadband only filters `gz < 0.6°/s`. So **5°/s leaks through every loop**, accumulating 300°/minute → **2700° in 9 minutes**. Matches exactly what you see.
+
+Also notice: **`reset_yaw` only zeroes `currentYaw` — it does NOT re-run calibration or fix the bad offset.** So after you press reset, the wrong offset keeps pumping yaw upward from zero.
+
+---
+
+### The Fix
+
+Three changes to [`esp_main.ino`](file:///c:/Users/Jeremy/Desktop/SCHOOL%20ACTIVITIES/500%20level/Final_Year_Project/Auto_Waste_Bin/CODE/TEST_WEB_Scrap/esp_main/esp_main.ino):
+
+1. **`calibrateMPU()`** — add a stability variance check. If the sensor was moving during calibration, the samples will have high variance → reject and retry.
+2. **`reset_yaw` API handler** — re-run calibration (with the robot now fully warmed up and stationary) instead of just zeroing `currentYaw`.
+3. **`updateMPU()`** — clamp `dt` to max 50ms to prevent any startup spike.
+
+Shall I apply all three fixes now?
+
+
+
+
+Option 1: Use mDNS (.local domain) — ⭐ Recommended & Easiest
+Instead of typing an IP address (like 192.168.1.45), you assign a fixed local domain name to the ESP32 (e.g., http://autowaste.local).
+
+You can open http://autowaste.local in Chrome, Edge, Safari, or on your phone, and it connects automatically—regardless of what IP the router assigned!
+
+How to add it in code:
+cpp
+#include <ESPmDNS.h>
+void setup() {
+  // ... after WiFi.begin() connects:
+  
+  if (MDNS.begin("autowaste")) {
+    Serial.println("✅ mDNS responder started: http://autowaste.local");
+  }
+}
+URL to open: http://autowaste.local
+Compatibility: Works natively on Windows 10/11, macOS, iOS (iPhone/iPad), and Android.
+
+the self correct speed slow ramp up seems to be too fast.
