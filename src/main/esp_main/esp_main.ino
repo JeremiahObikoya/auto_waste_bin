@@ -24,10 +24,12 @@
  * =============================================================================
  */
 
-#include <Arduino.h>
 #include "secrets.h" // ← Credentials & UDP ports
+#include "soc/rtc_cntl_reg.h"
+#include "soc/soc.h"
 #include <Adafruit_MPU6050.h>
 #include <Adafruit_Sensor.h>
+#include <Arduino.h>
 #include <ESP32Servo.h>
 #include <ESPmDNS.h>
 #include <Preferences.h>
@@ -35,8 +37,6 @@
 #include <WiFi.h>
 #include <WiFiUdp.h>
 #include <Wire.h>
-#include "soc/soc.h"
-#include "soc/rtc_cntl_reg.h"
 
 Preferences prefs;
 
@@ -55,7 +55,8 @@ Preferences prefs;
 #define I2C_SDA 21
 #define I2C_SCL 22
 
-// Camera servo pan angles for scan cycle: Front/Center (90°), Left (45°), Right (135°)
+// Camera servo pan angles for scan cycle: Front/Center (90°), Left (45°), Right
+// (135°)
 #define CAM_ANGLE_CENTER 90 // Center / Front
 #define CAM_ANGLE_LEFT 45   // Left pan
 #define CAM_ANGLE_RIGHT 135 // Right pan
@@ -79,6 +80,17 @@ enum SystemMode : uint8_t {
 };
 SystemMode currentMode = MODE_MANUAL;
 
+enum ManualDriveState {
+  MANUAL_IDLE,
+  MANUAL_DRIVE_FORWARD,
+  MANUAL_DRIVE_BACKWARD,
+  MANUAL_DRIVE_CIRCLE_LEFT,
+  MANUAL_DRIVE_CIRCLE_RIGHT,
+  MANUAL_OBSTACLE_AVOID
+};
+ManualDriveState manualDriveState = MANUAL_IDLE;
+ManualDriveState manualResumeState = MANUAL_IDLE;
+
 // ======================== GLOBAL SENSOR / MOTOR STATE ========================
 float latestDistanceCm = -1.0f;
 char currentMotorState[16] = "STOPPED";
@@ -89,8 +101,10 @@ int ultrasonicPos = 90;
 // ======================== SYSTEM PARAMETERS & NETWORK CONFIG =================
 float obstacleThresholdCm = 50.0f; // Safety stop distance (cm)
 int defaultDriveSpeed = 110;
-int turnLeftSpeed = 180;           // Calibrated minimum static friction breakaway for LEFT (180 PWM)
-int turnRightSpeed = 210;          // Calibrated minimum static friction breakaway for RIGHT (210 PWM)
+int turnLeftSpeed =
+    180; // Calibrated minimum static friction breakaway for LEFT (180 PWM)
+int turnRightSpeed =
+    210; // Calibrated minimum static friction breakaway for RIGHT (210 PWM)
 int camSteerGain = 2;              // Proportional gain for curve-steering
 float headingToleranceDeg = 12.0f; // Runtime tunable angle lock tolerance (deg)
 char currentLaptopIp[32] = "10.218.193.152";
@@ -121,9 +135,7 @@ void addLog(const char *msg) {
   totalLogsAdded++;
 }
 
-void addLog(const String &msg) {
-  addLog(msg.c_str());
-}
+void addLog(const String &msg) { addLog(msg.c_str()); }
 
 // ======================== MPU6050 CALIBRATED OFFSETS & I2C AUTO-RECOVERY =====
 // Calibrated from MPU6050 Web Calibration Tool:
@@ -132,9 +144,9 @@ const float CALIBRATED_GYRO_Z_OFFSET = 0.000141f; // 0.008 deg/s zero-rate bias
 const int16_t HW_ACCEL_OFFSET_X = -3556;
 const int16_t HW_ACCEL_OFFSET_Y = 272;
 const int16_t HW_ACCEL_OFFSET_Z = 1336;
-const int16_t HW_GYRO_OFFSET_X  = 91;
-const int16_t HW_GYRO_OFFSET_Y  = -17;
-const int16_t HW_GYRO_OFFSET_Z  = 12;
+const int16_t HW_GYRO_OFFSET_X = 91;
+const int16_t HW_GYRO_OFFSET_Y = -17;
+const int16_t HW_GYRO_OFFSET_Z = 12;
 
 bool mpuConnected = false;
 int mpuErrorCount = 0;
@@ -151,9 +163,11 @@ void writeMPURegister(uint8_t reg, uint8_t value) {
 }
 
 void applyMPUHardwareOffsets() {
-  if (!mpuConnected) return;
+  if (!mpuConnected)
+    return;
 
-  // Read existing Temperature Compensation (TC) bits from low byte registers (Bit 0)
+  // Read existing Temperature Compensation (TC) bits from low byte registers
+  // (Bit 0)
   Wire.beginTransmission(0x68);
   Wire.write(0x07);
   Wire.endTransmission(false);
@@ -201,11 +215,14 @@ void calibrateMPU() {
     sensors_event_t a, g, t;
     mpu.getEvent(&a, &g, &t);
     sum += g.gyro.z;
-    if (g.gyro.z < minGz) minGz = g.gyro.z;
-    if (g.gyro.z > maxGz) maxGz = g.gyro.z;
+    if (g.gyro.z < minGz)
+      minGz = g.gyro.z;
+    if (g.gyro.z > maxGz)
+      maxGz = g.gyro.z;
     delay(3);
   }
-  // Check if robot was moving during calibration (gyro spread > 0.08 rad/s ~ 4.5°/s)
+  // Check if robot was moving during calibration (gyro spread > 0.08 rad/s
+  // ~ 4.5°/s)
   if ((maxGz - minGz) > 0.08f) {
     addLog("⚠️ Movement detected during calibration! Retrying in 250ms...");
     delay(250);
@@ -219,7 +236,9 @@ void calibrateMPU() {
   }
   gyroZ_offset = sum / 300.0f;
   char offBuf[64];
-  snprintf(offBuf, sizeof(offBuf), "✅ MPU6050 calibrated. Offset: %.5f rad/s (%.3f °/s)", gyroZ_offset, gyroZ_offset * (180.0f / PI));
+  snprintf(offBuf, sizeof(offBuf),
+           "✅ MPU6050 calibrated. Offset: %.5f rad/s (%.3f °/s)", gyroZ_offset,
+           gyroZ_offset * (180.0f / PI));
   addLog(offBuf);
 }
 
@@ -260,10 +279,10 @@ void resetI2C() {
 }
 
 float currentGyroRateZ = 0.0f;
+float currentAccelJerk = 0.0f;
+float prevAccelX = 0.0f, prevAccelY = 0.0f;
 
 void updateMPU() {
-  if (!mpuConnected)
-    return;
   unsigned long now = micros();
   float dt = (now - lastSampleUs) / 1000000.0f;
   lastSampleUs = now;
@@ -271,6 +290,16 @@ void updateMPU() {
   // Guard against initial boot lag or loop delay spikes
   if (dt <= 0.0f || dt > 0.05f)
     dt = 0.01f;
+
+  if (!mpuConnected) {
+    // Attempt auto-recovery every 3 seconds if disconnected
+    static unsigned long lastAutoRecoverMs = 0;
+    if (millis() - lastAutoRecoverMs >= 3000) {
+      lastAutoRecoverMs = millis();
+      resetI2C();
+    }
+    return;
+  }
 
   bool ok = mpu.getEvent(&accelEv, &gyroEv, &tempEv);
   if (!ok || isnan(gyroEv.gyro.z) || isnan(accelEv.acceleration.x)) {
@@ -286,6 +315,13 @@ void updateMPU() {
   currentGyroRateZ = gz;
   if (fabsf(gz) > 0.4f)
     currentYaw += gz * dt;
+
+  // Track linear chassis vibration & acceleration jerk
+  float dAx = fabsf(accelEv.acceleration.x - prevAccelX);
+  float dAy = fabsf(accelEv.acceleration.y - prevAccelY);
+  currentAccelJerk = (currentAccelJerk * 0.7f) + ((dAx + dAy) * 0.3f);
+  prevAccelX = accelEv.acceleration.x;
+  prevAccelY = accelEv.acceleration.y;
 }
 
 // ======================== SERVO JITTER FIX (AUTO-DETACH) =====================
@@ -296,9 +332,9 @@ bool camAttached = false;
 unsigned long ultrasonicMoveMs = 0;
 unsigned long camMoveMs = 0;
 
-void writeUltrasonicServo(int angle) {
+void writeUltrasonicServo(int angle, bool force = false) {
   angle = constrain(angle, 0, 180);
-  if (angle != ultrasonicAngle || !ultrasonicAttached) {
+  if (angle != ultrasonicAngle || force) {
     if (!ultrasonicAttached) {
       ultrasonicServo.attach(SERVO_ULTRASONIC, 500, 2400);
       ultrasonicAttached = true;
@@ -310,9 +346,9 @@ void writeUltrasonicServo(int angle) {
   }
 }
 
-void writeCamServo(int angle) {
+void writeCamServo(int angle, bool force = false) {
   angle = constrain(angle, 0, 180);
-  if (angle != camAngleWritten || !camAttached) {
+  if (angle != camAngleWritten || force) {
     if (!camAttached) {
       camServo.attach(SERVO_CAM_PIN, 500, 2400);
       camAttached = true;
@@ -336,14 +372,19 @@ void serviceServos() {
 }
 
 // ======================== ADAPTIVE STALL & VOLTAGE COMPENSATION ==============
-// Automatically detects chassis stalls due to battery discharge or surface friction.
+// Automatically detects chassis stalls due to battery discharge or surface
+// friction.
 // - Turning: monitors Gyro Z angular rate & interval-based Yaw delta.
 // - Driving: monitors Accelerometer motion surge/vibration.
-// If robot is stalled over each check window, increases PWM by +12 step-by-step until motion is observed.
-unsigned long stallCheckIntervalMs = 400; // Global tunable stall check interval (default 400ms)
+// If robot is stalled over each check window, increases PWM by +12 step-by-step
+// until motion is observed.
+unsigned long stallCheckIntervalMs =
+    400; // Global tunable stall check interval (default 400ms)
 int stallBoostLeft = 0;
 int stallBoostRight = 0;
 int stallBoostDrive = 0;
+int stallBoostCircleL = 0;
+int stallBoostCircleR = 0;
 unsigned long motionStateStartMs = 0;
 unsigned long lastStallBoostMs = 0;
 char lastObservedMotorState[16] = "STOPPED";
@@ -379,11 +420,14 @@ void stopMotors() {
   stallBoostLeft = 0;
   stallBoostRight = 0;
   stallBoostDrive = 0;
+  stallBoostCircleL = 0;
+  stallBoostCircleR = 0;
 }
 
-// Non-blocking active electrical brake: drives all IN pins HIGH simultaneously to
-// short the motor back-EMF, applying maximum magnetic stopping torque.
-// Asynchronously serviced and released to coast by serviceBrake() after BRAKE_PULSE_DURATION_MS.
+// Non-blocking active electrical brake: drives all IN pins HIGH simultaneously
+// to short the motor back-EMF, applying maximum magnetic stopping torque.
+// Asynchronously serviced and released to coast by serviceBrake() after
+// BRAKE_PULSE_DURATION_MS.
 void brakeMotors() {
   strncpy(currentMotorState, "BRAKING", sizeof(currentMotorState));
   digitalWrite(PIN_IN1, HIGH);
@@ -400,7 +444,8 @@ void brakeMotors() {
 
 // Non-blocking brake pulse release service (called every loop() iteration)
 void serviceBrake() {
-  if (motorBrakingActive && (millis() - motorBrakeStartMs >= BRAKE_PULSE_DURATION_MS)) {
+  if (motorBrakingActive &&
+      (millis() - motorBrakeStartMs >= BRAKE_PULSE_DURATION_MS)) {
     digitalWrite(PIN_IN1, LOW);
     digitalWrite(PIN_IN2, LOW);
     digitalWrite(PIN_IN3, LOW);
@@ -462,6 +507,46 @@ void turnRight(int spd = 0) {
   setMotorSpeeds(effectiveSpd, effectiveSpd);
 }
 
+void circleLeft(int spd = 0) {
+  if (spd == 0)
+    spd = turnLeftSpeed;
+  int outerSpd = constrain(spd + stallBoostLeft + stallBoostCircleL, 210, 255);
+  // Inner wheels (Left): Light reverse (48-70 PWM) to break 4WD tire scrub
+  // while outer wheels (210-255 PWM) drive forward in a wide circle
+  int innerRevSpd = constrain(48 + (stallBoostCircleL / 4), 45, 70);
+  strncpy(currentMotorState, "CIRCLE_L", sizeof(currentMotorState));
+
+  // Left Motors (A): REVERSE at light speed (inner pivot)
+  digitalWrite(PIN_IN1, HIGH);
+  digitalWrite(PIN_IN2, LOW);
+
+  // Right Motors (B): FORWARD at high speed (outer arc)
+  digitalWrite(PIN_IN3, LOW);
+  digitalWrite(PIN_IN4, HIGH);
+
+  setMotorSpeeds(innerRevSpd, outerSpd);
+}
+
+void circleRight(int spd = 0) {
+  if (spd == 0)
+    spd = turnRightSpeed;
+  int outerSpd = constrain(spd + stallBoostRight + stallBoostCircleR, 210, 255);
+  // Inner wheels (Right): Light reverse (48-70 PWM) to break 4WD tire scrub
+  // while outer wheels (210-255 PWM) drive forward in a wide circle
+  int innerRevSpd = constrain(48 + (stallBoostCircleR / 4), 45, 70);
+  strncpy(currentMotorState, "CIRCLE_R", sizeof(currentMotorState));
+
+  // Left Motors (A): FORWARD at high speed (outer arc)
+  digitalWrite(PIN_IN1, LOW);
+  digitalWrite(PIN_IN2, HIGH);
+
+  // Right Motors (B): REVERSE at light speed (inner pivot)
+  digitalWrite(PIN_IN3, HIGH);
+  digitalWrite(PIN_IN4, LOW);
+
+  setMotorSpeeds(outerSpd, innerRevSpd);
+}
+
 void curveSteer(int8_t angleOffset) {
   strncpy(currentMotorState, "TRACKING", sizeof(currentMotorState));
   int base = defaultDriveSpeed + stallBoostDrive;
@@ -479,16 +564,26 @@ void curveSteer(int8_t angleOffset) {
 // Moving-window stall detector: checks progress every stallCheckIntervalMs
 void serviceStallCompensation() {
   // Safety check: only execute if MPU is healthy, valid, and connected
-  if (!mpuConnected || mpuErrorCount > 0 || isnan(gyroEv.gyro.z) || isnan(accelEv.acceleration.x))
+  if (!mpuConnected || mpuErrorCount > 0 || isnan(gyroEv.gyro.z) ||
+      isnan(accelEv.acceleration.x))
     return;
 
+  // Persistent breakaway kick state variables for manual/service stall recovery
+  static bool unwedgePulseActive = false;
+  static unsigned long unwedgePulseStartMs = 0;
+  static unsigned long maxPwmStallTimer = 0;
+
   // If stopped or braking, keep tracking reset
-  if (strcmp(currentMotorState, "STOPPED") == 0 || strcmp(currentMotorState, "BRAKING") == 0) {
+  if (strcmp(currentMotorState, "STOPPED") == 0 ||
+      strcmp(currentMotorState, "BRAKING") == 0) {
     if (strcmp(lastObservedMotorState, "STOPPED") != 0) {
-      strncpy(lastObservedMotorState, currentMotorState, sizeof(lastObservedMotorState));
+      strncpy(lastObservedMotorState, currentMotorState,
+              sizeof(lastObservedMotorState));
       motionStateStartMs = 0;
       lastStallBoostMs = 0;
       isStalled = false;
+      unwedgePulseActive = false;
+      maxPwmStallTimer = 0;
     }
     return;
   }
@@ -497,17 +592,43 @@ void serviceStallCompensation() {
 
   // If motion command state changed (e.g. STOPPED -> LEFT or FORWARD -> RIGHT)
   if (strcmp(currentMotorState, lastObservedMotorState) != 0) {
-    strncpy(lastObservedMotorState, currentMotorState, sizeof(lastObservedMotorState));
+    strncpy(lastObservedMotorState, currentMotorState,
+            sizeof(lastObservedMotorState));
     motionStateStartMs = now;
     lastStallBoostMs = now;
     lastRecordedYaw = currentYaw;
     lastRecordedAccelX = accelEv.acceleration.x;
     lastRecordedAccelY = accelEv.acceleration.y;
     isStalled = false;
+    unwedgePulseActive = false;
+    maxPwmStallTimer = 0;
     return;
   }
 
-  // Initial grace period for motor magnetic field to energize & attempt movement
+  // ── BREAKAWAY KICK IN FLIGHT (Non-blocking 180ms)
+  // ───────────────────────────
+  if (unwedgePulseActive) {
+    if (now - unwedgePulseStartMs < 180) {
+      return; // Let breakaway pulse complete
+    }
+    // Breakaway kick finished! Reapply active motion mode with high PWM
+    unwedgePulseActive = false;
+    maxPwmStallTimer = now;
+    lastRecordedYaw = currentYaw;
+    if (strcmp(currentMotorState, "LEFT") == 0) {
+      turnLeft(255);
+    } else if (strcmp(currentMotorState, "RIGHT") == 0) {
+      turnRight(255);
+    } else if (strcmp(currentMotorState, "CIRCLE_L") == 0) {
+      circleLeft(turnLeftSpeed);
+    } else if (strcmp(currentMotorState, "CIRCLE_R") == 0) {
+      circleRight(turnRightSpeed);
+    }
+    return;
+  }
+
+  // Initial grace period for motor magnetic field to energize & attempt
+  // movement
   if (now - motionStateStartMs < stallCheckIntervalMs)
     return;
 
@@ -516,32 +637,96 @@ void serviceStallCompensation() {
     return;
 
   // ── A. TURNING STALL DETECTION (LEFT / RIGHT) ─────────────────────────────
-  if (strcmp(currentMotorState, "LEFT") == 0 || strcmp(currentMotorState, "RIGHT") == 0) {
+  if (strcmp(currentMotorState, "LEFT") == 0 ||
+      strcmp(currentMotorState, "RIGHT") == 0) {
     float deltaYawInterval = fabsf(currentYaw - lastRecordedYaw);
     float rotRate = fabsf(currentGyroRateZ);
 
-    // If robot is stalled: very low angular velocity AND minimal yaw delta during this interval
+    // If robot is stalled: very low angular velocity AND minimal yaw delta
+    // during this interval
     if (rotRate < 3.5f && deltaYawInterval < 0.8f) {
       isStalled = true;
       if (strcmp(currentMotorState, "LEFT") == 0) {
-        stallBoostLeft = min(stallBoostLeft + 12, 255 - turnLeftSpeed);
-        int newSpd = constrain(turnLeftSpeed + stallBoostLeft, turnLeftSpeed, 255);
-        setMotorSpeeds(newSpd, newSpd);
-        Serial.printf("⚡ [STALL BOOST -> LEFT] Yaw: %6.1f° stuck! Rate: %4.1f°/s, Delta: %4.1f° in %lums | Boost: +%d -> Applied PWM: %d\n",
-                      currentYaw, rotRate, deltaYawInterval, stallCheckIntervalMs, stallBoostLeft, newSpd);
-      } else {
-        stallBoostRight = min(stallBoostRight + 12, 255 - turnRightSpeed);
-        int newSpd = constrain(turnRightSpeed + stallBoostRight, turnRightSpeed, 255);
-        setMotorSpeeds(newSpd, newSpd);
-        Serial.printf("⚡ [STALL BOOST -> RIGHT] Yaw: %6.1f° stuck! Rate: %4.1f°/s, Delta: %4.1f° in %lums | Boost: +%d -> Applied PWM: %d\n",
-                      currentYaw, rotRate, deltaYawInterval, stallCheckIntervalMs, stallBoostRight, newSpd);
+        int maxBoost = 255 - turnLeftSpeed;
+        if (stallBoostLeft < maxBoost) {
+          stallBoostLeft = min(stallBoostLeft + 15, maxBoost);
+          int newSpd =
+              constrain(turnLeftSpeed + stallBoostLeft, turnLeftSpeed, 255);
+          setMotorSpeeds(newSpd, newSpd);
+          maxPwmStallTimer = now;
+          Serial.printf(
+              "⚡ [STALL BOOST -> LEFT] Yaw: %6.1f° stuck! Rate: %4.1f°/s, "
+              "Delta: %4.1f° in %lums | Boost: +%d -> Applied PWM: %d\n",
+              currentYaw, rotRate, deltaYawInterval, stallCheckIntervalMs,
+              stallBoostLeft, newSpd);
+        } else {
+          // Reached MAXIMUM PWM and still stalled -> Trigger Force-Move
+          // Breakaway Kick!
+          if (maxPwmStallTimer == 0)
+            maxPwmStallTimer = now;
+          if (now - maxPwmStallTimer >= 600) {
+            Serial.printf("🚨 [FORCE MOVE -> LEFT] Reached Max PWM (%d) and "
+                          "still stalled! Applying 180ms Breakaway Kick...\n",
+                          currentSpeedA);
+            addLog("⚡ [FORCE MOVE] Maximum PWM reached on LEFT turn — "
+                   "executing breakaway kick!");
+            unwedgePulseActive = true;
+            unwedgePulseStartMs = now;
+            // Reverse kick pulse to unstick caster
+            digitalWrite(PIN_IN1, LOW);
+            digitalWrite(PIN_IN2, HIGH);
+            digitalWrite(PIN_IN3, HIGH);
+            digitalWrite(PIN_IN4, LOW);
+            setMotorSpeeds(255, 255);
+            return;
+          }
+        }
+      } else { // RIGHT
+        int maxBoost = 255 - turnRightSpeed;
+        if (stallBoostRight < maxBoost) {
+          stallBoostRight = min(stallBoostRight + 15, maxBoost);
+          int newSpd =
+              constrain(turnRightSpeed + stallBoostRight, turnRightSpeed, 255);
+          setMotorSpeeds(newSpd, newSpd);
+          maxPwmStallTimer = now;
+          Serial.printf(
+              "⚡ [STALL BOOST -> RIGHT] Yaw: %6.1f° stuck! Rate: %4.1f°/s, "
+              "Delta: %4.1f° in %lums | Boost: +%d -> Applied PWM: %d\n",
+              currentYaw, rotRate, deltaYawInterval, stallCheckIntervalMs,
+              stallBoostRight, newSpd);
+        } else {
+          // Reached MAXIMUM PWM and still stalled -> Trigger Force-Move
+          // Breakaway Kick!
+          if (maxPwmStallTimer == 0)
+            maxPwmStallTimer = now;
+          if (now - maxPwmStallTimer >= 600) {
+            Serial.printf("🚨 [FORCE MOVE -> RIGHT] Reached Max PWM (%d) and "
+                          "still stalled! Applying 180ms Breakaway Kick...\n",
+                          currentSpeedA);
+            addLog("⚡ [FORCE MOVE] Maximum PWM reached on RIGHT turn — "
+                   "executing breakaway kick!");
+            unwedgePulseActive = true;
+            unwedgePulseStartMs = now;
+            // Reverse kick pulse to unstick caster
+            digitalWrite(PIN_IN1, HIGH);
+            digitalWrite(PIN_IN2, LOW);
+            digitalWrite(PIN_IN3, LOW);
+            digitalWrite(PIN_IN4, HIGH);
+            setMotorSpeeds(255, 255);
+            return;
+          }
+        }
       }
     } else if (rotRate >= 5.0f || deltaYawInterval >= 1.2f) {
       if (isStalled) {
         isStalled = false;
-        Serial.printf("🚀 [MOTION RESUMED -> %s] Yaw: %6.1f° | Rate: %5.1f°/s | Delta: %4.1f° | Boost: +%d | Applied PWM: %d\n",
+        maxPwmStallTimer = 0;
+        Serial.printf("🚀 [MOTION RESUMED -> %s] Yaw: %6.1f° | Rate: %5.1f°/s "
+                      "| Delta: %4.1f° | Boost: +%d | Holding PWM: %d\n",
                       currentMotorState, currentYaw, rotRate, deltaYawInterval,
-                      (strcmp(currentMotorState, "LEFT") == 0 ? stallBoostLeft : stallBoostRight),
+                      (strcmp(currentMotorState, "LEFT") == 0
+                           ? stallBoostLeft
+                           : stallBoostRight),
                       currentSpeedA);
       }
     }
@@ -550,19 +735,126 @@ void serviceStallCompensation() {
     lastRecordedYaw = currentYaw;
   }
 
-  // ── B. LINEAR DRIVE STALL DETECTION (FORWARD / BACKWARD) ──────────────────
-  else if (strcmp(currentMotorState, "FORWARD") == 0 || strcmp(currentMotorState, "BACKWARD") == 0) {
+  // ── B. CIRCLING STALL DETECTION (CIRCLE_L / CIRCLE_R) ──────────────────────
+  else if (strcmp(currentMotorState, "CIRCLE_L") == 0 ||
+           strcmp(currentMotorState, "CIRCLE_R") == 0) {
+    float deltaYawInterval = fabsf(currentYaw - lastRecordedYaw);
+    float rotRate = fabsf(currentGyroRateZ);
+
+    // MPU6050 Verification: Must observe genuine turning angular velocity or
+    // yaw delta for circular orbit
+    bool isMovingCircle = (rotRate >= 4.0f || deltaYawInterval >= 1.0f);
+
+    // If robot is stalled while trying to circle:
+    if (!isMovingCircle) {
+      isStalled = true;
+      if (strcmp(currentMotorState, "CIRCLE_L") == 0) {
+        int maxBoost = 255 - turnLeftSpeed;
+        if (stallBoostCircleL < maxBoost) {
+          stallBoostCircleL = min(stallBoostCircleL + 15, maxBoost);
+          circleLeft(turnLeftSpeed);
+          maxPwmStallTimer = now;
+          Serial.printf("⚡ [STALL BOOST -> CIRCLE_L] Stalled! Rate: %4.1f°/s, "
+                        "Delta: %4.1f° | Boost: +%d -> Applied PWM: (%d, %d)\n",
+                        rotRate, deltaYawInterval, stallBoostCircleL,
+                        currentSpeedA, currentSpeedB);
+        } else {
+          // Reached MAXIMUM PWM and still stalled -> Trigger Force-Move
+          // Breakaway Kick!
+          if (maxPwmStallTimer == 0)
+            maxPwmStallTimer = now;
+          if (now - maxPwmStallTimer >= 600) {
+            Serial.printf(
+                "🚨 [FORCE MOVE -> CIRCLE_L] Max PWM reached (%d, %d) but "
+                "still stalled! Applying 180ms Breakaway Kick...\n",
+                currentSpeedA, currentSpeedB);
+            addLog("⚡ [FORCE MOVE] Maximum PWM reached while circling LEFT — "
+                   "executing breakaway kick!");
+            unwedgePulseActive = true;
+            unwedgePulseStartMs = now;
+            // Forceful pivot Left kick at 255 PWM to overcome static floor
+            // friction
+            digitalWrite(PIN_IN1, HIGH);
+            digitalWrite(PIN_IN2, LOW);
+            digitalWrite(PIN_IN3, LOW);
+            digitalWrite(PIN_IN4, HIGH);
+            setMotorSpeeds(255, 255);
+            return;
+          }
+        }
+      } else { // CIRCLE_R
+        int maxBoost = 255 - turnRightSpeed;
+        if (stallBoostCircleR < maxBoost) {
+          stallBoostCircleR = min(stallBoostCircleR + 15, maxBoost);
+          circleRight(turnRightSpeed);
+          maxPwmStallTimer = now;
+          Serial.printf("⚡ [STALL BOOST -> CIRCLE_R] Stalled! Rate: %4.1f°/s, "
+                        "Delta: %4.1f° | Boost: +%d -> Applied PWM: (%d, %d)\n",
+                        rotRate, deltaYawInterval, stallBoostCircleR,
+                        currentSpeedA, currentSpeedB);
+        } else {
+          // Reached MAXIMUM PWM and still stalled -> Trigger Force-Move
+          // Breakaway Kick!
+          if (maxPwmStallTimer == 0)
+            maxPwmStallTimer = now;
+          if (now - maxPwmStallTimer >= 600) {
+            Serial.printf(
+                "🚨 [FORCE MOVE -> CIRCLE_R] Max PWM reached (%d, %d) but "
+                "still stalled! Applying 180ms Breakaway Kick...\n",
+                currentSpeedA, currentSpeedB);
+            addLog("⚡ [FORCE MOVE] Maximum PWM reached while circling RIGHT — "
+                   "executing breakaway kick!");
+            unwedgePulseActive = true;
+            unwedgePulseStartMs = now;
+            // Forceful pivot Right kick at 255 PWM to overcome static floor
+            // friction
+            digitalWrite(PIN_IN1, LOW);
+            digitalWrite(PIN_IN2, HIGH);
+            digitalWrite(PIN_IN3, HIGH);
+            digitalWrite(PIN_IN4, LOW);
+            setMotorSpeeds(255, 255);
+            return;
+          }
+        }
+      }
+    } else {
+      // Robot HAS STARTED MOVING! Stop increasing PWM and hold steady.
+      if (isStalled) {
+        isStalled = false;
+        maxPwmStallTimer = 0;
+        Serial.printf("🚀 [MOTION RESUMED -> %s] Yaw: %6.1f° | Rate: %5.1f°/s "
+                      "| Delta: %4.1f° | Holding PWM: (%d, %d)\n",
+                      currentMotorState, currentYaw, rotRate, deltaYawInterval,
+                      currentSpeedA, currentSpeedB);
+      }
+    }
+
+    lastStallBoostMs = now;
+    lastRecordedYaw = currentYaw;
+    lastRecordedAccelX = accelEv.acceleration.x;
+    lastRecordedAccelY = accelEv.acceleration.y;
+  }
+
+  // ── C. LINEAR DRIVE STALL DETECTION (FORWARD / BACKWARD) ──────────────────
+  else if (strcmp(currentMotorState, "FORWARD") == 0 ||
+           strcmp(currentMotorState, "BACKWARD") == 0) {
     float deltaAx = fabsf(accelEv.acceleration.x - lastRecordedAccelX);
     float deltaAy = fabsf(accelEv.acceleration.y - lastRecordedAccelY);
     float motionJerk = deltaAx + deltaAy;
 
     // If rolling chassis vibration or linear surge is absent (< 0.15 m/s^2):
     if (motionJerk < 0.15f) {
-      stallBoostDrive = min(stallBoostDrive + 10, 255 - defaultDriveSpeed);
-      int newSpd = constrain(defaultDriveSpeed + stallBoostDrive, defaultDriveSpeed, 255);
+      stallBoostDrive = min(stallBoostDrive + 12, 255 - defaultDriveSpeed);
+      int newSpd = constrain(defaultDriveSpeed + stallBoostDrive,
+                             defaultDriveSpeed, 255);
       setMotorSpeeds(newSpd, newSpd);
-      Serial.printf("⚡ [STALL BOOST -> DRIVE] Forward/Back sag! Boost: +%d -> Applied PWM: %d\n",
+      Serial.printf("⚡ [STALL BOOST -> DRIVE] Forward/Back sag! Boost: +%d -> "
+                    "Applied PWM: %d\n",
                     stallBoostDrive, newSpd);
+    } else if (motionJerk >= 0.25f) {
+      if (isStalled) {
+        isStalled = false;
+      }
     }
 
     lastStallBoostMs = now;
@@ -582,15 +874,43 @@ float readUltrasonic() {
   return (dur == 0) ? -1.0f : (dur * SOUND_SPEED) / 2.0f;
 }
 
+// 5-Ping Max Filter: takes numPings readings and returns the MAX valid distance
+// detected. Max is the safest filter against acoustic deflection / false
+// obstacles. Returns -1.0f only if all pings timed out.
+float readUltrasonicMaxFilter(int numPings = 5, int pingIntervalMs = 15) {
+  float maxDist = -1.0f;
+  for (int i = 0; i < numPings; i++) {
+    float d = readUltrasonic();
+    if (d > 0.0f) {
+      if (maxDist < 0.0f || d > maxDist) {
+        maxDist = d;
+      }
+    }
+    if (i < numPings - 1) {
+      delay(pingIntervalMs);
+    }
+  }
+  return maxDist;
+}
+
+bool isRobotMovingLinear() {
+  if (!mpuConnected || mpuErrorCount > 0)
+    return true; // Fallback if MPU offline
+  return (currentAccelJerk >= 0.08f);
+}
+
 // ======================== UDP WI-FI ROUTER COMMUNICATION =====================
 struct __attribute__((packed)) CamPacket {
-  uint8_t state; // 0=SCANNING, 1=TRACKING, 2=INTERACTION, 3=RELEASE, 4=SCAN_STEP_DONE, 5=OBSTACLE_CHECK, 6=IS_TARGET, 7=IS_OBSTACLE
+  uint8_t
+      state; // 0=SCANNING, 1=TRACKING, 2=INTERACTION, 3=RELEASE,
+             // 4=SCAN_STEP_DONE, 5=OBSTACLE_CHECK, 6=IS_TARGET, 7=IS_OBSTACLE
   int8_t angleOffset;
 };
 
 struct __attribute__((packed)) MainPacket {
-  uint8_t pktType;    // 0=Mode/Heartbeat, 1=Config Sync, 5=Trigger Obstacle Check
-  uint8_t systemMode; // 0=MANUAL, 1=AUTONOMOUS, 2=CAM_GUIDED, 3=PAUSED, 5=OBSTACLE_CHECK
+  uint8_t pktType; // 0=Mode/Heartbeat, 1=Config Sync, 5=Trigger Obstacle Check
+  uint8_t systemMode; // 0=MANUAL, 1=AUTONOMOUS, 2=CAM_GUIDED, 3=PAUSED,
+                      // 5=OBSTACLE_CHECK
   char laptopIp[32];
   char wifiSsid[33];
   char wifiPass[65];
@@ -598,7 +918,8 @@ struct __attribute__((packed)) MainPacket {
 
 CamPacket lastCamPkt = {0, 0};
 bool newCamPkt = false;
-unsigned long lastCamRxMs = 0; // Timestamp of last received packet from ESP32-CAM
+unsigned long lastCamRxMs =
+    0; // Timestamp of last received packet from ESP32-CAM
 bool camPaused = false;
 
 void broadcastMode(uint8_t pktType = 0) {
@@ -620,7 +941,8 @@ void broadcastMode(uint8_t pktType = 0) {
     udp.write((const uint8_t *)&pkt, sizeof(pkt));
     udp.endPacket();
   }
-  Serial.printf("[UDP TX] systemMode=%d, laptopIp=%s, pktType=%d\n", pkt.systemMode, pkt.laptopIp, pktType);
+  Serial.printf("[UDP TX] systemMode=%d, laptopIp=%s, pktType=%d\n",
+                pkt.systemMode, pkt.laptopIp, pktType);
 }
 
 void checkUdpPackets() {
@@ -630,9 +952,11 @@ void checkUdpPackets() {
       udp.read((uint8_t *)&lastCamPkt, sizeof(CamPacket));
       newCamPkt = true;
       lastCamRxMs = millis();
-      Serial.printf("[UDP RX] CamPacket: state=%d, angleOffset=%d\n", lastCamPkt.state, lastCamPkt.angleOffset);
+      Serial.printf("[UDP RX] CamPacket: state=%d, angleOffset=%d\n",
+                    lastCamPkt.state, lastCamPkt.angleOffset);
     } else {
-      // Discard unexpected broadcast packets (e.g. router mDNS, PC discovery) to prevent LwIP buffer leaks
+      // Discard unexpected broadcast packets (e.g. router mDNS, PC discovery)
+      // to prevent LwIP buffer leaks
       while (udp.available()) {
         udp.read();
       }
@@ -644,44 +968,51 @@ void checkUdpPackets() {
 // ======================== CLOSED-LOOP YAW HEADING CONTROL ====================
 // Precision Heading Control Algorithm:
 //   1. Acceptance & Settle Window:
-//      - When |targetAngle - currentYaw| <= tolerance, triggers non-blocking active electrical brake.
-//      - Settle dwell timer requires error to remain <= tolerance continuously for SETTLE_WINDOW_MS (180ms)
+//      - When |targetAngle - currentYaw| <= tolerance, triggers non-blocking
+//      active electrical brake.
+//      - Settle dwell timer requires error to remain <= tolerance continuously
+//      for SETTLE_WINDOW_MS (180ms)
 //        AND the 80ms electrical brake pulse to complete before returning true.
 //   2. Deceleration Zone (absErr < 30°):
 //      - Dynamically scales down turn speed toward base breakaway speed.
-//      - Dynamic stall boost (+stallBoost) is automatically added if static friction prevents reaching target.
+//      - Dynamic stall boost (+stallBoost) is automatically added if static
+//      friction prevents reaching target.
 //   3. Far Zone (absErr >= 30°):
-//      - Starts at base breakaway speed and smoothly ramps up (+25 PWM / 1000ms) up to 255 PWM.
+//      - Starts at base breakaway speed and smoothly ramps up (+25 PWM /
+//      1000ms) up to 255 PWM.
 //   4. Automatic Breakaway Kick / Unwedge Routine:
-//      - If robot is stuck at maximum power (>245 PWM / max boost) for >= 1200ms with zero rotation (<0.8°),
-//        executes a brief 180ms swing-pivot or reverse kick to overcome static floor friction / caster bind.
+//      - If robot is stuck at maximum power (>245 PWM / max boost) for >=
+//      1200ms with zero rotation (<0.8°),
+//        executes a brief 180ms swing-pivot or reverse kick to overcome static
+//        floor friction / caster bind.
 bool rotateToHeading(float targetAngle, float tolerance = -1.0f) {
   // Use configured tolerance if none specified
   if (tolerance <= 0.0f)
     tolerance = headingToleranceDeg;
 
-  // Enforce a safe floor (at least 1.0°) so a low NVS value never causes oscillation
+  // Enforce a safe floor (at least 1.0°) so a low NVS value never causes
+  // oscillation
   if (tolerance < 1.0f)
     tolerance = 1.0f;
 
-  // ── No MPU fallback: timed blind turn ───────────────────────────────────────
+  // ── Hard Safety Interlock: Abort turn & halt motors if MPU is disconnected
+  // ──
   if (!mpuConnected) {
-    static unsigned long noMpuTimer = 0;
-    if (noMpuTimer == 0)
-      noMpuTimer = millis();
-    if (millis() - noMpuTimer >= 800) {
-      noMpuTimer = 0;
-      stopMotors();
-      return true;
+    stopMotors();
+    static unsigned long lastRotateWarnMs = 0;
+    if (millis() - lastRotateWarnMs >= 2000) {
+      lastRotateWarnMs = millis();
+      addLog("❌ [SAFETY HALT] Turning aborted — MPU6050 is DISCONNECTED!");
     }
-    turnRight(turnRightSpeed);
-    return false;
+    return true; // Abort turn immediately
   }
 
   // ── Compute shortest-path error (-180° to +180°) ───────────────────────────
   float error = targetAngle - currentYaw;
-  while (error >  180.0f) error -= 360.0f;
-  while (error < -180.0f) error += 360.0f;
+  while (error > 180.0f)
+    error -= 360.0f;
+  while (error < -180.0f)
+    error += 360.0f;
   float absErr = fabsf(error);
 
   // Persistent ramp, settle, brake, and unwedge state variables
@@ -696,7 +1027,8 @@ bool rotateToHeading(float targetAngle, float tolerance = -1.0f) {
   static float lastStallObservedYaw = 0.0f;
   static uint8_t unwedgeAttemptCount = 0;
 
-  const unsigned long SETTLE_WINDOW_MS = 180; // Required continuous in-tolerance dwell time
+  const unsigned long SETTLE_WINDOW_MS =
+      180; // Required continuous in-tolerance dwell time
 
   // ── ACCEPTANCE & SETTLE WINDOW (absErr <= tolerance) ───────────────────────
   if (absErr <= tolerance) {
@@ -704,7 +1036,8 @@ bool rotateToHeading(float targetAngle, float tolerance = -1.0f) {
     maxPwmStallTimer = 0;
     unwedgeAttemptCount = 0;
 
-    // First cycle entering the tolerance window: start dwell timer and trigger active brake
+    // First cycle entering the tolerance window: start dwell timer and trigger
+    // active brake
     if (settleStartMs == 0) {
       settleStartMs = millis();
       if (!brakeInitiated && !motorBrakingActive) {
@@ -716,18 +1049,21 @@ bool rotateToHeading(float targetAngle, float tolerance = -1.0f) {
     static unsigned long lastInTolLogMs = 0;
     if (millis() - lastInTolLogMs >= 80) {
       lastInTolLogMs = millis();
-      Serial.printf("⏳ [IN TOLERANCE] Target: %6.1f° | Yaw: %6.1f° | Err: %5.1f° (Tol: ±%.1f°) | Dwell: %lu/%lums | PWM: (%d, %d) | Brake: %s\n",
-                    targetAngle, currentYaw, error, tolerance,
-                    (millis() - settleStartMs), SETTLE_WINDOW_MS,
-                    currentSpeedA, currentSpeedB,
-                    motorBrakingActive ? "ACTIVE" : "RELEASED");
+      Serial.printf(
+          "⏳ [IN TOLERANCE] Target: %6.1f° | Yaw: %6.1f° | Err: %5.1f° (Tol: "
+          "±%.1f°) | Dwell: %lu/%lums | PWM: (%d, %d) | Brake: %s\n",
+          targetAngle, currentYaw, error, tolerance, (millis() - settleStartMs),
+          SETTLE_WINDOW_MS, currentSpeedA, currentSpeedB,
+          motorBrakingActive ? "ACTIVE" : "RELEASED");
     }
 
-    // Verify dwell condition: must remain continuously in tolerance for SETTLE_WINDOW_MS
-    // AND the non-blocking brake pulse must have fully released.
+    // Verify dwell condition: must remain continuously in tolerance for
+    // SETTLE_WINDOW_MS AND the non-blocking brake pulse must have fully
+    // released.
     if ((millis() - settleStartMs >= SETTLE_WINDOW_MS) && !motorBrakingActive) {
       stopMotors();
-      Serial.printf("🎯 [TURN LOCKED] Target: %6.1f° | Final Yaw: %6.1f° | Final Err: %5.1f° | Settled in window -> ADVANCING!\n",
+      Serial.printf("🎯 [TURN LOCKED] Target: %6.1f° | Final Yaw: %6.1f° | "
+                    "Final Err: %5.1f° | Settled in window -> ADVANCING!\n",
                     targetAngle, currentYaw, error);
       settleStartMs = 0;
       brakeInitiated = false;
@@ -748,7 +1084,9 @@ bool rotateToHeading(float targetAngle, float tolerance = -1.0f) {
   settleStartMs = 0;
   brakeInitiated = false;
 
-  int8_t currentTurnDir = (error > 0) ? 1 : -1; // +1 = Left (increases yaw), -1 = Right (decreases yaw)
+  int8_t currentTurnDir =
+      (error > 0) ? 1
+                  : -1; // +1 = Left (increases yaw), -1 = Right (decreases yaw)
 
   // Reset ramp timer if turn direction changed or new turn started
   if (rampStartMs == 0 || currentTurnDir != lastTurnDir) {
@@ -773,18 +1111,22 @@ bool rotateToHeading(float targetAngle, float tolerance = -1.0f) {
 
   int baseSpd = (currentTurnDir > 0) ? turnLeftSpeed : turnRightSpeed;
 
-  // Smooth linear far-zone ramp speed: base breakaway PWM + 25 PWM / 1000ms up to 255
+  // Smooth linear far-zone ramp speed: base breakaway PWM + 25 PWM / 1000ms up
+  // to 255
   unsigned long elapsedMs = millis() - rampStartMs;
   int rampAdd = (int)((elapsedMs * 25) / 1000);
   int farSpd = constrain(baseSpd + rampAdd, baseSpd, 255);
 
   int spd = farSpd;
 
-  // Deceleration zone: fixed 30° boundary based on physical chassis stopping distance.
-  const float decelBoundary = 30.0f; // Degrees before target to begin slowing down
+  // Deceleration zone: fixed 30° boundary based on physical chassis stopping
+  // distance.
+  const float decelBoundary =
+      30.0f; // Degrees before target to begin slowing down
 
   if (absErr < decelBoundary) {
-    float decelFactor = constrain((absErr - tolerance) / (decelBoundary - tolerance), 0.0f, 1.0f);
+    float decelFactor = constrain(
+        (absErr - tolerance) / (decelBoundary - tolerance), 0.0f, 1.0f);
     int maxDecelEntrySpd = min(farSpd, baseSpd + 15);
     spd = baseSpd + (int)(decelFactor * (maxDecelEntrySpd - baseSpd));
   }
@@ -813,25 +1155,39 @@ bool rotateToHeading(float targetAngle, float tolerance = -1.0f) {
         unwedgeAttemptCount++;
 
         if (unwedgeAttemptCount % 2 == 1) {
-          // Swing-Pivot Kick: power the outer wheel forward (255 PWM), let inner wheel coast (0 PWM)
-          // Rolling leverage breaks static friction and instantly flips the caster wheel!
-          Serial.printf("⚡ [BREAKAWAY KICK #%d] Stalled at 255 PWM for 1.2s! Applying SWING-PIVOT pulse (outer wheel forward)...\n", unwedgeAttemptCount);
+          // Swing-Pivot Kick: power the outer wheel forward (255 PWM), let
+          // inner wheel coast (0 PWM) Rolling leverage breaks static friction
+          // and instantly flips the caster wheel!
+          Serial.printf("⚡ [BREAKAWAY KICK #%d] Stalled at 255 PWM for 1.2s! "
+                        "Applying SWING-PIVOT pulse (outer wheel forward)...\n",
+                        unwedgeAttemptCount);
           if (currentTurnDir > 0) {
-            // Turning Left: drive right wheel (Motor B) forward, left wheel coast
-            digitalWrite(PIN_IN1, LOW); digitalWrite(PIN_IN2, LOW);
-            digitalWrite(PIN_IN3, LOW); digitalWrite(PIN_IN4, HIGH);
+            // Turning Left: drive right wheel (Motor B) forward, left wheel
+            // coast
+            digitalWrite(PIN_IN1, LOW);
+            digitalWrite(PIN_IN2, LOW);
+            digitalWrite(PIN_IN3, LOW);
+            digitalWrite(PIN_IN4, HIGH);
             setMotorSpeeds(0, 255);
           } else {
-            // Turning Right: drive left wheel (Motor A) forward, right wheel coast
-            digitalWrite(PIN_IN1, LOW); digitalWrite(PIN_IN2, HIGH);
-            digitalWrite(PIN_IN3, LOW); digitalWrite(PIN_IN4, LOW);
+            // Turning Right: drive left wheel (Motor A) forward, right wheel
+            // coast
+            digitalWrite(PIN_IN1, LOW);
+            digitalWrite(PIN_IN2, HIGH);
+            digitalWrite(PIN_IN3, LOW);
+            digitalWrite(PIN_IN4, LOW);
             setMotorSpeeds(255, 0);
           }
         } else {
-          // Reverse-Nudge Kick: brief reverse (180 PWM) to un-stick any physical binding
-          Serial.printf("⚡ [BREAKAWAY KICK #%d] Stalled at 255 PWM for 1.2s! Applying REVERSE-NUDGE pulse...\n", unwedgeAttemptCount);
-          digitalWrite(PIN_IN1, HIGH); digitalWrite(PIN_IN2, LOW);
-          digitalWrite(PIN_IN3, HIGH); digitalWrite(PIN_IN4, LOW);
+          // Reverse-Nudge Kick: brief reverse (180 PWM) to un-stick any
+          // physical binding
+          Serial.printf("⚡ [BREAKAWAY KICK #%d] Stalled at 255 PWM for 1.2s! "
+                        "Applying REVERSE-NUDGE pulse...\n",
+                        unwedgeAttemptCount);
+          digitalWrite(PIN_IN1, HIGH);
+          digitalWrite(PIN_IN2, LOW);
+          digitalWrite(PIN_IN3, HIGH);
+          digitalWrite(PIN_IN4, LOW);
           setMotorSpeeds(180, 180);
         }
         return false;
@@ -850,11 +1206,12 @@ bool rotateToHeading(float targetAngle, float tolerance = -1.0f) {
   static unsigned long lastOutTolLogMs = 0;
   if (millis() - lastOutTolLogMs >= 100) {
     lastOutTolLogMs = millis();
-    Serial.printf("🧭 [TURN %-5s] Target: %6.1f° | Yaw: %6.1f° | Err: %5.1f° (Tol: ±%.1f°) | Rate: %5.1f°/s | Base: %d | Ramp: +%d | StallBoost: +%d | ENA(L): %3d | ENB(R): %3d | Zone: %s\n",
-                  (currentTurnDir > 0 ? "LEFT" : "RIGHT"),
-                  targetAngle, currentYaw, error, tolerance,
-                  currentGyroRateZ, baseSpd, (spd - baseSpd), activeBoost,
-                  currentSpeedA, currentSpeedB,
+    Serial.printf("🧭 [TURN %-5s] Target: %6.1f° | Yaw: %6.1f° | Err: %5.1f° "
+                  "(Tol: ±%.1f°) | Rate: %5.1f°/s | Base: %d | Ramp: +%d | "
+                  "StallBoost: +%d | ENA(L): %3d | ENB(R): %3d | Zone: %s\n",
+                  (currentTurnDir > 0 ? "LEFT" : "RIGHT"), targetAngle,
+                  currentYaw, error, tolerance, currentGyroRateZ, baseSpd,
+                  (spd - baseSpd), activeBoost, currentSpeedA, currentSpeedB,
                   (absErr < decelBoundary ? "DECEL" : "FAR_RAMP"));
   }
 
@@ -870,28 +1227,34 @@ enum FacingOrientation : uint8_t {
 };
 
 enum CamGuidedSub {
-  CG_IDLE,           // Initial entry / reset
-  CG_SCANNING_CYCLE, // Stepping camera servo: Center (90°) → Left (45°) → Right (135°)
-  CG_TURN_180_REAR,  // Robot rotating 180° with MPU6050 to face rear
-  CG_TURN_180_FRONT, // Robot rotating 180° with MPU6050 back to front
-  CG_IDLE_WAIT,      // 10 s idle rest period
-  CG_TRACKING,       // Person detected — moving forward & curve-steering
-  CG_CHECK_OBSTACLE, // Front obstacle detected while tracking — query Gemini (target vs blocker)
-  CG_AVOID_OBSTACLE, // Obstacle in path confirmed blocker — scanning left/right and steering around
+  CG_IDLE,         // Initial entry / reset
+  CG_SCAN_CHECK,   // Facing straight ahead (90°), waiting for ESP32-CAM frame
+                   // capture & Gemini response
+  CG_SCAN_TURN_90, // Rotate chassis 90° LEFT with MPU6050 to scan next
+                   // direction
+  CG_TRACKING, // Person detected — moving forward & curve-steering straight to
+               // target
+  CG_CHECK_OBSTACLE, // Front obstacle detected while tracking — query Gemini
+                     // (target vs blocker)
+  CG_AVOID_OBSTACLE, // Obstacle in path confirmed blocker — 7-point sweep &
+                     // closed-loop angle swerve
   CG_PRESENT_TURN,   // Turn 90° Left upon reaching target to present bin
   CG_WAIT_DROP,      // Wait 5 seconds for waste drop
-  CG_RESTORE_TURN,   // Turn 90° Right back to approach orientation
-  CG_BACKOFF_ROTATE  // 180° departure turn to face other side and resume scan
+  CG_RESTORE_TURN,   // Turn 90° Left again to face away from person
+  CG_DEPART_DRIVE    // Drive forward away from person for 2 seconds
+                     // (accel-verified), then clear target & resume scan
 };
 
 CamGuidedSub cgSub = CG_IDLE;
 FacingOrientation robotOrientation = ORIENTATION_FRONT;
-int currentCycle = 1; // 1 or 2
-int currentStep = 0;  // 0=CENTER (90°), 1=LEFT (45°), 2=RIGHT (135°)
+int currentCycle = 1;
+int currentStep = 0;
 unsigned long stepStartMs = 0;
 unsigned long idleStartMs = 0;
 unsigned long cgReverseStart = 0;
 unsigned long haltStartMs = 0;
+unsigned long cgDepartTimer = 0;
+unsigned long cgVerifiedDepartMs = 0;
 unsigned long obstacleCheckTimer = 0;
 int avoidStep = 0;
 unsigned long avoidTimer = 0;
@@ -902,14 +1265,77 @@ float cgSavedApproachYaw = 0.0f;
 char camStateStr[64] = "IDLE";
 int8_t camAngleOffset = 0;
 
-const char *getStepName(int step) {
-  if (step == 0)
-    return "CENTER (90°)";
-  if (step == 1)
-    return "LEFT (45°)";
-  if (step == 2)
-    return "RIGHT (135°)";
-  return "--";
+// Obstacle Avoidance & Gated Reverse Backup State
+unsigned long verifiedBackupMs = 0;
+unsigned long backupLastMs = 0;
+unsigned long backupStartWallMs = 0;
+int cgAvoidRetries = 0;
+int cgSweepIdx = 0;
+float cgSweepDistances[7] = {-1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f};
+int avoidSubStep = 0;
+int classAvoidRetries = 0;
+unsigned long avoidSubTimer = 0;
+float avoidLeftDist = -1.0f;
+float avoidRightDist = -1.0f;
+float targetAvoidHeading = 0.0f;
+
+// 7-Point Panoramic Sweep Angles (0° = Right, 90° = Center, 180° = Left)
+const int SCAN_ANGLES[7] = {0, 30, 60, 90, 120, 150, 180};
+float sweepDistances[7] = {-1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f};
+int currentSweepIdx = 0;
+
+// Evaluates the 7-point sweep and returns the best angle (0 to 180).
+// Returns 90 if center is clear, or best angle (0..180) based on clearance and
+// minimum deviation. Returns -1 if all directions are blocked.
+int evaluateSweepPath(const float dists[7], float thresholdCm) {
+  char mapBuf[160];
+  snprintf(mapBuf, sizeof(mapBuf),
+           "📡 [SWEEP MAP] 0°:%.0fcm | 30°:%.0fcm | 60°:%.0fcm | 90°:%.0fcm | "
+           "120°:%.0fcm | 150°:%.0fcm | 180°:%.0fcm",
+           dists[0], dists[1], dists[2], dists[3], dists[4], dists[5],
+           dists[6]);
+  addLog(mapBuf);
+
+  // If dead-ahead (90°) has a valid distance > threshold, continue forward
+  if (dists[3] > thresholdCm) {
+    return 90;
+  }
+
+  // Candidate angle pairs sorted by minimum angular deviation from 90°
+  // Pair 0: 120° (Left +30°) vs 60° (Right -30°)
+  // Pair 1: 150° (Left +60°) vs 30° (Right -60°)
+  // Pair 2: 180° (Left +90°) vs 0°  (Right -90°)
+  int candidatePairs[3][2] = {
+      {4, 2}, // index 4 = 120°, index 2 = 60°
+      {5, 1}, // index 5 = 150°, index 1 = 30°
+      {6, 0}  // index 6 = 180°, index 0 = 0°
+  };
+
+  for (int pair = 0; pair < 3; pair++) {
+    int lIdx = candidatePairs[pair][0];
+    int rIdx = candidatePairs[pair][1];
+
+    // When front is blocked by a wall, timeouts (<= 0) at angled positions are
+    // specular acoustic reflections off the wall itself, NOT open air. A
+    // direction is ONLY considered CLEAR if it returned a genuine valid
+    // measurement > thresholdCm.
+    bool lClear = (dists[lIdx] > thresholdCm);
+    bool rClear = (dists[rIdx] > thresholdCm);
+
+    float lDist = lClear ? dists[lIdx] : 0.0f;
+    float rDist = rClear ? dists[rIdx] : 0.0f;
+
+    if (lClear && rClear) {
+      // Both sides clear: pick the side with greater clearance depth
+      return (lDist >= rDist) ? SCAN_ANGLES[lIdx] : SCAN_ANGLES[rIdx];
+    } else if (lClear) {
+      return SCAN_ANGLES[lIdx];
+    } else if (rClear) {
+      return SCAN_ANGLES[rIdx];
+    }
+  }
+
+  return -1; // All angles blocked by wall/obstacle -> Trigger reverse backup!
 }
 
 void processCamGuided() {
@@ -917,6 +1343,18 @@ void processCamGuided() {
     return;
   if (camPaused) {
     stopMotors();
+    return;
+  }
+
+  // Hard Safety Interlock: MPU6050 must be connected
+  if (!mpuConnected) {
+    stopMotors();
+    strncpy(camStateStr, "HALTED: MPU DISCONNECTED", sizeof(camStateStr));
+    static unsigned long lastCamMpuWarn = 0;
+    if (millis() - lastCamMpuWarn >= 3000) {
+      lastCamMpuWarn = millis();
+      addLog("🚨 [SAFETY HALT] Camera Mode halted — MPU6050 connection lost!");
+    }
     return;
   }
 
@@ -945,82 +1383,99 @@ void processCamGuided() {
     stopMotors();
     strncpy(camStateStr, "WAITING FOR DROP (5s)", sizeof(camStateStr));
     if (now - haltStartMs >= 5000 || (isNewPacket && pkt.state == 3)) {
-      cgRotateTarget = cgSavedApproachYaw; // Turn 90° RIGHT back to original approach orientation
-      addLog("⏰ 5s elapsed / drop confirmed! Turning 90° RIGHT back to approach heading...");
+      cgRotateTarget =
+          currentYaw +
+          90.0f; // Turn 90° LEFT again from current presented bin position
+      addLog("⏰ 5s elapsed / drop confirmed! Turning 90° LEFT to face "
+             "departure heading...");
       cgSub = CG_RESTORE_TURN;
-      strncpy(camStateStr, "TURNING 90° R", sizeof(camStateStr));
+      strncpy(camStateStr, "TURNING 90° L DEPART", sizeof(camStateStr));
     }
     return;
   }
 
-  // ── 90° Turn Right to Restore Original Heading ────────────────────────────
+  // ── 90° Turn Left to Face Away from Person ────────────────────────────────
   if (cgSub == CG_RESTORE_TURN) {
-    strncpy(camStateStr, "TURNING 90° R", sizeof(camStateStr));
+    strncpy(camStateStr, "TURNING 90° L DEPART", sizeof(camStateStr));
     if (rotateToHeading(cgRotateTarget)) {
       stopMotors();
-      cgRotateTarget = currentYaw + 180.0f; // Turn 180° to face other side
-      addLog("🔄 Aligned! Starting 180° departure turn to face other side...");
-      cgSub = CG_BACKOFF_ROTATE;
-      strncpy(camStateStr, "ROTATING 180°", sizeof(camStateStr));
+      writeUltrasonicServo(90);
+      writeCamServo(CAM_ANGLE_CENTER);
+      cgDepartTimer = millis();
+      cgVerifiedDepartMs = 0;
+      addLog("🚗 90° Left turn locked! Moving forward away from person (2.0s "
+             "verified)...");
+      cgSub = CG_DEPART_DRIVE;
+      strncpy(camStateStr, "DEPARTING (2s)", sizeof(camStateStr));
     }
     return;
   }
 
-  // ── 180° Departure Turn to Face Other Side & Scan ─────────────────────────
-  if (cgSub == CG_BACKOFF_ROTATE) {
-    strncpy(camStateStr, "ROTATING 180°", sizeof(camStateStr));
-    if (rotateToHeading(cgRotateTarget)) {
+  // ── Move Forward Away from Person for 2 Seconds & Reset Target ────────────
+  if (cgSub == CG_DEPART_DRIVE) {
+    strncpy(camStateStr, "DEPARTING (2s)", sizeof(camStateStr));
+    writeUltrasonicServo(90);
+    moveForward(defaultDriveSpeed);
+
+    unsigned long dtMs = (cgDepartTimer == 0) ? 0 : (now - cgDepartTimer);
+    cgDepartTimer = now;
+    bool isMoving = isRobotMovingLinear();
+    if (isMoving && dtMs > 0 && dtMs < 500) {
+      cgVerifiedDepartMs += dtMs;
+    }
+
+    // Obstacle safety check during departure
+    if (latestDistanceCm > 0 && latestDistanceCm <= obstacleThresholdCm) {
       stopMotors();
-      addLog("✅ Departure turn complete — ready for next scan.");
+      addLog("🚧 Obstacle ahead during departure — stopping departure drive "
+             "early.");
+      cgVerifiedDepartMs = 2000; // Trigger completion
+    }
+
+    if (cgVerifiedDepartMs >= 2000) {
+      stopMotors();
+      cgVerifiedDepartMs = 0;
+      cgDepartTimer = 0;
       writeCamServo(CAM_ANGLE_CENTER);
       writeUltrasonicServo(90);
+
+      // CLEAR ALL TARGET DATA & PACKETS so robot starts with a fresh slate
+      lastCamPkt.state = 0;
+      lastCamPkt.angleOffset = 0;
+      newCamPkt = false;
+      broadcastMode(4); // Send explicit vision reset (pktType 4) to ESP32-CAM
+      delay(10);
+      broadcastMode(0); // Sync current mode (CAM_GUIDED)
+
       cgSub = CG_IDLE;
       strncpy(camStateStr, "IDLE", sizeof(camStateStr));
+      addLog("✅ Departure complete (2.0s verified). Target cleared. Starting "
+             "fresh 90° scan...");
     }
     return;
   }
 
-  // ── 180° MPU Turn to Face REAR ────────────────────────────────────────────
-  if (cgSub == CG_TURN_180_REAR) {
-    strncpy(camStateStr, "ROTATING 180° TO REAR", sizeof(camStateStr));
+  // ── 90° Left Chassis Turn to Next Scan Quadrant ───────────────────────────
+  if (cgSub == CG_SCAN_TURN_90) {
+    strncpy(camStateStr, "TURNING 90° L NEXT VIEW", sizeof(camStateStr));
     if (rotateToHeading(cgRotateTarget)) {
       stopMotors();
-      robotOrientation = ORIENTATION_REAR;
-      currentCycle = 1;
-      currentStep = 0;
       writeCamServo(CAM_ANGLE_CENTER);
+      writeUltrasonicServo(90);
+      broadcastMode(
+          4); // Command ESP32-CAM to begin fresh capture in this new direction
+      delay(10);
+      broadcastMode(0);
       stepStartMs = millis();
-      addLog("✅ 180° turn complete — robot is now facing REAR.");
-      addLog("📡 [REAR] Cycle 1/2 — checking CENTER (90°)...");
-      cgSub = CG_SCANNING_CYCLE;
-      strncpy(camStateStr, "SCANNING REAR (1/2 CENTER)", sizeof(camStateStr));
+      cgSub = CG_SCAN_CHECK;
+      strncpy(camStateStr, "SCANNING AHEAD (90°)", sizeof(camStateStr));
+      char qBuf[80];
+      snprintf(qBuf, sizeof(qBuf),
+               "✅ 90° Left turn locked (Heading: %.1f°). Capturing frame "
+               "ahead at 90°...",
+               currentYaw);
+      addLog(qBuf);
     }
-    return;
-  }
-
-  // ── 180° MPU Turn to Face FRONT ───────────────────────────────────────────
-  if (cgSub == CG_TURN_180_FRONT) {
-    strncpy(camStateStr, "ROTATING 180° TO FRONT", sizeof(camStateStr));
-    if (rotateToHeading(cgRotateTarget)) {
-      stopMotors();
-      robotOrientation = ORIENTATION_FRONT;
-      idleStartMs = millis();
-      addLog("✅ 180° turn complete — robot is now facing FRONT.");
-      addLog("💤 No targets found in 360°. Entering 10-second Idle Mode...");
-      cgSub = CG_IDLE_WAIT;
-      strncpy(camStateStr, "IDLE — WAITING (10s)", sizeof(camStateStr));
-    }
-    return;
-  }
-
-  // ── Target Detected during Scanning Cycle ─────────────────────────────────
-  if (cgSub == CG_SCANNING_CYCLE && isNewPacket && pkt.state == 1) {
-    String orientStr = (robotOrientation == ORIENTATION_FRONT) ? "FRONT" : "REAR";
-    addLog("🎯 Target detected facing " + orientStr + "! Centering camera and approaching target...");
-    writeCamServo(CAM_ANGLE_CENTER);
-    cgSub = CG_TRACKING;
-    snprintf(camStateStr, sizeof(camStateStr), "TRACKING (%s)", orientStr.c_str());
-    curveSteer(pkt.angleOffset);
     return;
   }
 
@@ -1029,84 +1484,55 @@ void processCamGuided() {
 
   case CG_IDLE:
     stopMotors();
-    robotOrientation = ORIENTATION_FRONT;
-    currentCycle = 1;
-    currentStep = 0;
     writeCamServo(CAM_ANGLE_CENTER);
+    writeUltrasonicServo(90);
+    broadcastMode(4);
+    delay(10);
+    broadcastMode(0);
     stepStartMs = now;
-    addLog("📡 [FRONT] Autonomous scan started — Cycle 1/2: checking CENTER (90°)...");
-    cgSub = CG_SCANNING_CYCLE;
-    strncpy(camStateStr, "SCANNING FRONT (1/2 CENTER)", sizeof(camStateStr));
+    cgSub = CG_SCAN_CHECK;
+    strncpy(camStateStr, "SCANNING AHEAD (90°)", sizeof(camStateStr));
+    addLog("📡 [CAM SCAN] Camera locked at 90° ahead — capturing frame for "
+           "Gemini...");
     break;
 
-  case CG_SCANNING_CYCLE: {
+  case CG_SCAN_CHECK:
     stopMotors();
-    String orient = (robotOrientation == ORIENTATION_FRONT) ? "FRONT" : "REAR";
-    snprintf(camStateStr, sizeof(camStateStr), "SCANNING %s (%d/2 %s)",
-             orient.c_str(), currentCycle, getStepName(currentStep));
 
-    // ONLY advance to next angle when ESP32-CAM confirms a completed SCAN_STEP_DONE (state 4)
+    // If target detected in front (state 1 = TRACKING)
+    if (isNewPacket && pkt.state == 1) {
+      addLog("🎯 Target detected directly ahead! Approaching target...");
+      cgSub = CG_TRACKING;
+      strncpy(camStateStr, "TRACKING TARGET", sizeof(camStateStr));
+      curveSteer(pkt.angleOffset);
+      return;
+    }
+
+    // If no target confirmed (state 4 = SCAN_STEP_DONE / NONE)
     if (isNewPacket && pkt.state == 4) {
-      currentStep++;
-      Serial.printf("📷 [UDP SCAN STEP] Received SCAN_STEP_DONE from ESP32-CAM -> Advancing to step %d (%s)\n",
-                    currentStep, getStepName(currentStep));
+      addLog("🔄 No target ahead in this quadrant — turning 90° LEFT to scan "
+             "next direction...");
+      cgRotateTarget = currentYaw + 90.0f; // Turn 90° Left (+90° CCW)
+      cgSub = CG_SCAN_TURN_90;
+      strncpy(camStateStr, "TURNING 90° L NEXT VIEW", sizeof(camStateStr));
+      return;
+    }
 
-      if (currentStep == 1) {
-        writeCamServo(CAM_ANGLE_LEFT);
-        stepStartMs = millis();
-        addLog("🔍 [" + orient + "] Cycle " + String(currentCycle) + "/2 — checking LEFT (45°)...");
-      } else if (currentStep == 2) {
-        writeCamServo(CAM_ANGLE_RIGHT);
-        stepStartMs = millis();
-        addLog("🔍 [" + orient + "] Cycle " + String(currentCycle) + "/2 — checking RIGHT (135°)...");
-      } else {
-        currentStep = 0;
-        writeCamServo(CAM_ANGLE_CENTER);
-        currentCycle++;
-
-        if (currentCycle <= 2) {
-          stepStartMs = millis();
-          addLog("🔍 [" + orient + "] Starting Scan Cycle 2/2 — checking CENTER (90°)...");
-        } else {
-          if (robotOrientation == ORIENTATION_FRONT) {
-            addLog("❌ 2 cycles completed facing FRONT — no one detected.");
-            addLog("🔄 Rotating robot 180° with MPU6050 to check REAR...");
-            cgRotateTarget = currentYaw + 180.0f;
-            cgSub = CG_TURN_180_REAR;
-            strncpy(camStateStr, "ROTATING 180° TO REAR", sizeof(camStateStr));
-          } else {
-            addLog("❌ 2 cycles completed facing REAR — no one detected.");
-            addLog("🔄 Rotating robot 180° with MPU6050 back to FRONT...");
-            cgRotateTarget = currentYaw + 180.0f;
-            cgSub = CG_TURN_180_FRONT;
-            strncpy(camStateStr, "ROTATING 180° TO FRONT", sizeof(camStateStr));
-          }
-        }
-      }
+    // Guard timeout (14 seconds with no response from camera/network)
+    if (now - stepStartMs >= 14000) {
+      addLog("⏱️ Scan check timed out — turning 90° LEFT to scan next "
+             "direction...");
+      cgRotateTarget = currentYaw + 90.0f;
+      cgSub = CG_SCAN_TURN_90;
+      strncpy(camStateStr, "TURNING 90° L NEXT VIEW", sizeof(camStateStr));
     }
     break;
-  }
-
-  case CG_IDLE_WAIT: {
-    stopMotors();
-    static unsigned long lastIdleLogMs = 0;
-    if (now - lastIdleLogMs >= 3000) {
-      lastIdleLogMs = now;
-      long remaining = (IDLE_DURATION_MS - (now - idleStartMs)) / 1000;
-      if (remaining > 0)
-        addLog("⏳ Idle — resuming scan in " + String(remaining) + " s...");
-    }
-    if (now - idleStartMs >= IDLE_DURATION_MS) {
-      addLog("⏰ Idle complete. Restarting Autonomous Scan routine...");
-      cgSub = CG_IDLE;
-    }
-    break;
-  }
 
   case CG_TRACKING:
     strncpy(camStateStr, "TRACKING", sizeof(camStateStr));
     if (pkt.state == 1) {
-      // Obstacle detected in path while approaching person -> verify if obstacle is target or blocker
+      // Obstacle detected in path while approaching person -> verify if
+      // obstacle is target or blocker
       if (latestDistanceCm > 0 && latestDistanceCm < obstacleThresholdCm) {
         stopMotors();
         writeCamServo(CAM_ANGLE_CENTER);
@@ -1114,7 +1540,8 @@ void processCamGuided() {
         cgSub = CG_CHECK_OBSTACLE;
         obstacleCheckTimer = now;
         strncpy(camStateStr, "VERIFYING OBSTACLE", sizeof(camStateStr));
-        addLog("🚧 Obstacle at " + String(latestDistanceCm, 1) + " cm! Querying Gemini to verify if it is target or blocker...");
+        addLog("🚧 Obstacle at " + String(latestDistanceCm, 1) +
+               " cm! Querying Gemini to verify if it is target or blocker...");
         broadcastMode(5); // Trigger camera node state 5
         return;
       }
@@ -1140,7 +1567,8 @@ void processCamGuided() {
     stopMotors();
     strncpy(camStateStr, "VERIFYING OBSTACLE", sizeof(camStateStr));
 
-    // Handle response from ESP32-CAM (states 6 = IS_TARGET, 7 = IS_OBSTACLE, 2 = INTERACTION, 3 = RELEASE)
+    // Handle response from ESP32-CAM (states 6 = IS_TARGET, 7 = IS_OBSTACLE, 2
+    // = INTERACTION, 3 = RELEASE)
     if (isNewPacket) {
       if (pkt.state == 6 || pkt.state == 2 || pkt.state == 3) {
         stopMotors();
@@ -1148,14 +1576,16 @@ void processCamGuided() {
         writeUltrasonicServo(90);
         cgSavedApproachYaw = currentYaw;
         cgRotateTarget = currentYaw + 90.0f; // Turn 90° Left (+90°)
-        addLog("🎯 Gemini confirmed obstacle IS the target! Turning 90° LEFT to present bin...");
+        addLog("🎯 Gemini confirmed obstacle IS the target! Turning 90° LEFT "
+               "to present bin...");
         cgSub = CG_PRESENT_TURN;
         strncpy(camStateStr, "PRESENTING BIN (90° L)", sizeof(camStateStr));
       } else if (pkt.state == 7 || pkt.state == 0) {
-        addLog("🚧 Gemini confirmed obstacle is an UNRELATED BLOCKER. Starting avoidance swerve...");
+        addLog("🚧 Gemini confirmed obstacle is an UNRELATED BLOCKER. Starting "
+               "180° panoramic scan...");
         avoidStep = 0;
         avoidTimer = now;
-        writeUltrasonicServo(120); // Look left 120°
+        writeUltrasonicServo(SCAN_ANGLES[0]); // Start sweep at 0°
         cgSub = CG_AVOID_OBSTACLE;
         strncpy(camStateStr, "AVOIDING OBSTACLE", sizeof(camStateStr));
       }
@@ -1163,10 +1593,11 @@ void processCamGuided() {
 
     // Timeout fallback after 10 seconds if no Gemini answer arrives
     if (now - obstacleCheckTimer >= 10000) {
-      addLog("⏱️ Gemini verification timed out — treating as obstacle to avoid.");
+      addLog(
+          "⏱️ Gemini verification timed out — starting 180° panoramic scan...");
       avoidStep = 0;
       avoidTimer = now;
-      writeUltrasonicServo(120);
+      writeUltrasonicServo(SCAN_ANGLES[0]);
       cgSub = CG_AVOID_OBSTACLE;
     }
     break;
@@ -1174,76 +1605,173 @@ void processCamGuided() {
 
   case CG_AVOID_OBSTACLE: {
     strncpy(camStateStr, "AVOIDING OBSTACLE", sizeof(camStateStr));
-    static int cgAvoidRetries = 0;
-    if (pkt.state == 0) {
-      addLog("⚠️ Target lost during avoidance — restarting scan.");
-      stopMotors();
-      writeUltrasonicServo(90);
-      cgAvoidRetries = 0;
-      cgSub = CG_IDLE;
-      return;
-    }
+
     switch (avoidStep) {
-    case 0: // Scan Left 120° (300ms settle)
-      writeUltrasonicServo(120);
-      if (now - avoidTimer >= 300) {
-        leftAvoidDist = readUltrasonic();
-        writeUltrasonicServo(60); // Look right 60°
+    // Step 0: 7-Point Panoramic Radar Sweep (0° -> 180°) with 200ms dwell &
+    // 5-ping max filter
+    case 0:
+      if (cgSweepIdx < 7) {
+        writeUltrasonicServo(SCAN_ANGLES[cgSweepIdx]);
+        unsigned long requiredDwell =
+            (cgSweepIdx == 0) ? 300 : 200; // 300ms for initial 0° repositioning
+        if (now - avoidTimer >= requiredDwell) {
+          cgSweepDistances[cgSweepIdx] = readUltrasonicMaxFilter(5, 15);
+          cgSweepIdx++;
+          avoidTimer = now;
+        }
+      } else {
+        // Sweep complete! Immediately return sensor to 90°
+        writeUltrasonicServo(90);
+        cgSweepIdx = 0;
         avoidTimer = now;
         avoidStep = 1;
       }
       break;
-    case 1: // Scan Right 60° (300ms settle)
-      if (now - avoidTimer >= 300) {
-        rightAvoidDist = readUltrasonic();
-        writeUltrasonicServo(90); // Re-center sonar
-        avoidTimer = now;
-        avoidStep = 2;
-      }
-      break;
-    case 2: // Decide path (wait 250ms for center servo to settle)
-      if (now - avoidTimer >= 250) {
-        float currentDist = readUltrasonic();
-        if (currentDist <= 0 || currentDist > obstacleThresholdCm) {
-          addLog("✅ Path clear — resuming camera tracking.");
+
+    // Step 1: Decision & Target Calculation
+    case 1:
+      if (now - avoidTimer >= 150) {
+        int bestAngle =
+            evaluateSweepPath(cgSweepDistances, obstacleThresholdCm);
+        if (bestAngle == 90) {
+          addLog("✅ Path straight ahead is clear — resuming camera tracking.");
+          writeUltrasonicServo(90);
           cgAvoidRetries = 0;
           cgSub = CG_TRACKING;
+        } else if (bestAngle >= 0) {
+          float angleOffset = (float)(bestAngle - 90);
+          cgRotateTarget = currentYaw + angleOffset;
+          char planBuf[96];
+          snprintf(planBuf, sizeof(planBuf),
+                   "💡 Swerving to %d° corridor (Offset: %+.0f°) -> Target "
+                   "Heading: %.1f°",
+                   bestAngle, angleOffset, cgRotateTarget);
+          addLog(planBuf);
+          cgAvoidRetries = 0;
+          avoidStep = 2; // Advance to closed-loop turn
         } else {
+          // All 7 angles blocked
           cgAvoidRetries++;
-          if (cgAvoidRetries >= 3) {
-            addLog("⚠️ Path remained blocked after 3 attempts — reversing and re-planning...");
-            moveBackward(defaultDriveSpeed);
-            delay(1000);
-            stopMotors();
-            cgAvoidRetries = 0;
-            cgSub = CG_TRACKING;
+          char retryBuf[80];
+          snprintf(retryBuf, sizeof(retryBuf),
+                   "⚠️ All 7 sweep angles blocked (Attempt %d/5)...",
+                   cgAvoidRetries);
+          addLog(retryBuf);
+
+          if (cgAvoidRetries >= 5) {
+            addLog("🚨 DEADLOCK: 5 failed attempts! Turning 180° LEFT and "
+                   "restarting scan...");
+            cgRotateTarget = currentYaw + 180.0f;
+            avoidStep = 5; // Deadlock 180° turn sub-step
           } else {
-            float l = (leftAvoidDist <= 0) ? 999.0f : leftAvoidDist;
-            float r = (rightAvoidDist <= 0) ? 999.0f : rightAvoidDist;
-            if (l > r && l > obstacleThresholdCm) {
-              addLog("💡 Swerving LEFT around obstacle");
-              turnLeft(turnLeftSpeed);
-              avoidTimer = now;
-              avoidStep = 3;
-            } else if (r >= l && r > obstacleThresholdCm) {
-              addLog("💡 Swerving RIGHT around obstacle");
-              turnRight(turnRightSpeed);
-              avoidTimer = now;
-              avoidStep = 3;
-            } else {
-              addLog("⚠️ Both sides narrow — backing up...");
-              moveBackward(defaultDriveSpeed);
-              avoidTimer = now;
-              avoidStep = 3;
-            }
+            addLog(
+                "⚠️ Reversing 1000ms (accel-verified) to open up clearance...");
+            verifiedBackupMs = 0;
+            backupLastMs = millis();
+            backupStartWallMs = millis();
+            avoidStep = 4; // Accel-gated backup sub-step
           }
         }
       }
       break;
-    case 3: // Complete swerve step (wait 350ms)
-      if (now - avoidTimer >= 350) {
+
+    // Step 2: Closed-Loop Gyro Heading Turn to Swerve Angle
+    case 2:
+      if (rotateToHeading(cgRotateTarget)) {
         stopMotors();
+        writeUltrasonicServo(90); // Guarantee sensor looking forward
+        avoidTimer = millis();
+        avoidStep = 3;
+      }
+      break;
+
+    // Step 3: Forward Bypass & Real-time Obstacle Safety Check
+    case 3: {
+      writeUltrasonicServo(90); // Keep looking dead ahead
+
+      // Real-time obstacle check while on bypass movement!
+      float curDist = readUltrasonic();
+      if (curDist > 0 && curDist <= obstacleThresholdCm) {
+        stopMotors();
+        char obsWarn[96];
+        snprintf(obsWarn, sizeof(obsWarn),
+                 "🚨 Secondary obstacle ahead during bypass (%.1f cm)! "
+                 "Reversing to clear...",
+                 curDist);
+        addLog(obsWarn);
+        cgAvoidRetries++;
+        if (cgAvoidRetries >= 5) {
+          addLog("🚨 DEADLOCK: 5 failed attempts! Turning 180° LEFT and "
+                 "restarting scan...");
+          cgRotateTarget = currentYaw + 180.0f;
+          avoidStep = 5; // 180° escape
+        } else {
+          verifiedBackupMs = 0;
+          backupLastMs = millis();
+          backupStartWallMs = millis();
+          avoidStep = 4; // Back up 1000ms
+        }
+        break;
+      }
+
+      moveForward(defaultDriveSpeed);
+      if (now - avoidTimer >= 1000) {
+        stopMotors();
+        writeUltrasonicServo(90);
+        addLog("✅ Obstacle bypassed — resuming camera tracking.");
         cgSub = CG_TRACKING;
+      }
+      break;
+    }
+
+    // Step 4: Accelerometer-Gated Reverse Backup (1000ms verified motion)
+    case 4: {
+      moveBackward(defaultDriveSpeed);
+      unsigned long dtMs = (backupLastMs == 0) ? 0 : (now - backupLastMs);
+      backupLastMs = now;
+
+      bool moving = isRobotMovingLinear();
+      if (moving && dtMs > 0 && dtMs < 500) {
+        verifiedBackupMs += dtMs;
+      }
+
+      static unsigned long lastCgLogMs = 0;
+      if (now - lastCgLogMs >= 250) {
+        lastCgLogMs = now;
+        Serial.printf("⚡ [CAM BACKUP] Motion: %s (Jerk: %.3f) | Verified: "
+                      "%lu/1000ms | PWM: %d\n",
+                      moving ? "MOVING" : "STALLED/SLIP", currentAccelJerk,
+                      verifiedBackupMs, currentSpeedA);
+      }
+
+      if (verifiedBackupMs >= 1000 || (now - backupStartWallMs >= 3500)) {
+        stopMotors();
+        writeUltrasonicServo(90);
+        verifiedBackupMs = 0;
+        backupLastMs = 0;
+        avoidStep = 0; // Re-scan
+        avoidTimer = millis();
+      }
+      break;
+    }
+
+    // Step 5: Deadlock Escape 180° Turn & Fresh Scan
+    case 5:
+      if (rotateToHeading(cgRotateTarget)) {
+        stopMotors();
+        writeUltrasonicServo(90);
+        writeCamServo(CAM_ANGLE_CENTER);
+        cgAvoidRetries = 0;
+        broadcastMode(4); // Send explicit vision reset (pktType 4) to ESP32-CAM
+        delay(10);
+        broadcastMode(0); // Sync current mode
+        robotOrientation = ORIENTATION_FRONT;
+        currentCycle = 1;
+        currentStep = 0;
+        cgSub = CG_IDLE;
+        strncpy(camStateStr, "IDLE", sizeof(camStateStr));
+        addLog("✅ 180° Turn complete — starting fresh 360° scan for new "
+               "targets...");
       }
       break;
     }
@@ -1252,6 +1780,231 @@ void processCamGuided() {
 
   default:
     break;
+  }
+}
+
+// ======================== MANUAL MODE CONTINUOUS DRIVE & AVOIDANCE
+// ============
+void processManualMode() {
+  if (currentMode != MODE_MANUAL)
+    return;
+
+  unsigned long now = millis();
+
+  switch (manualDriveState) {
+
+  case MANUAL_IDLE:
+    // Stopped
+    break;
+
+  case MANUAL_DRIVE_FORWARD: {
+    moveForward(defaultDriveSpeed);
+    writeUltrasonicServo(90);
+
+    // Active obstacle check while cruising forward
+    if (latestDistanceCm > 0 && latestDistanceCm <= obstacleThresholdCm) {
+      stopMotors();
+      char obsBuf[96];
+      snprintf(obsBuf, sizeof(obsBuf),
+               "🚨 [MANUAL] Obstacle at %.1f cm! Initiating avoidance sweep...",
+               latestDistanceCm);
+      addLog(obsBuf);
+      manualResumeState = MANUAL_DRIVE_FORWARD;
+      avoidSubStep = 0;
+      avoidSubTimer = now;
+      classAvoidRetries = 0;
+      manualDriveState = MANUAL_OBSTACLE_AVOID;
+    }
+    break;
+  }
+
+  case MANUAL_DRIVE_BACKWARD: {
+    moveBackward(defaultDriveSpeed);
+    // Keep moving backward continuously until STOP is pressed
+    break;
+  }
+
+  case MANUAL_DRIVE_CIRCLE_LEFT: {
+    circleLeft(turnLeftSpeed);
+    writeUltrasonicServo(90);
+
+    // Active obstacle check while circling
+    if (latestDistanceCm > 0 && latestDistanceCm <= obstacleThresholdCm) {
+      stopMotors();
+      char obsBuf[96];
+      snprintf(obsBuf, sizeof(obsBuf),
+               "🚨 [MANUAL] Obstacle at %.1f cm while circling LEFT! "
+               "Initiating avoidance...",
+               latestDistanceCm);
+      addLog(obsBuf);
+      manualResumeState = MANUAL_DRIVE_CIRCLE_LEFT;
+      avoidSubStep = 0;
+      avoidSubTimer = now;
+      classAvoidRetries = 0;
+      manualDriveState = MANUAL_OBSTACLE_AVOID;
+    }
+    break;
+  }
+
+  case MANUAL_DRIVE_CIRCLE_RIGHT: {
+    circleRight(turnRightSpeed);
+    writeUltrasonicServo(90);
+
+    // Active obstacle check while circling
+    if (latestDistanceCm > 0 && latestDistanceCm <= obstacleThresholdCm) {
+      stopMotors();
+      char obsBuf[96];
+      snprintf(obsBuf, sizeof(obsBuf),
+               "🚨 [MANUAL] Obstacle at %.1f cm while circling RIGHT! "
+               "Initiating avoidance...",
+               latestDistanceCm);
+      addLog(obsBuf);
+      manualResumeState = MANUAL_DRIVE_CIRCLE_RIGHT;
+      avoidSubStep = 0;
+      avoidSubTimer = now;
+      classAvoidRetries = 0;
+      manualDriveState = MANUAL_OBSTACLE_AVOID;
+    }
+    break;
+  }
+
+  case MANUAL_OBSTACLE_AVOID: {
+    switch (avoidSubStep) {
+    // Sub-step 0: 7-Point Panoramic Radar Sweep (0° -> 180°) with 200ms dwell &
+    // 5-ping max filter
+    case 0:
+      if (currentSweepIdx < 7) {
+        writeUltrasonicServo(SCAN_ANGLES[currentSweepIdx]);
+        unsigned long requiredDwell = (currentSweepIdx == 0) ? 300 : 200;
+        if (now - avoidSubTimer >= requiredDwell) {
+          sweepDistances[currentSweepIdx] = readUltrasonicMaxFilter(5, 15);
+          currentSweepIdx++;
+          avoidSubTimer = now;
+        }
+      } else {
+        writeUltrasonicServo(90);
+        currentSweepIdx = 0;
+        avoidSubTimer = now;
+        avoidSubStep = 1;
+      }
+      break;
+
+    // Sub-step 1: Decision & Target Calculation
+    case 1:
+      if (now - avoidSubTimer >= 150) {
+        int bestAngle = evaluateSweepPath(sweepDistances, obstacleThresholdCm);
+        if (bestAngle == 90) {
+          addLog("✅ Path straight ahead is clear — resuming manual drive.");
+          writeUltrasonicServo(90);
+          classAvoidRetries = 0;
+          manualDriveState = manualResumeState;
+        } else if (bestAngle >= 0) {
+          float angleOffset = (float)(bestAngle - 90);
+          targetAvoidHeading = currentYaw + angleOffset;
+          char planBuf[96];
+          snprintf(
+              planBuf, sizeof(planBuf),
+              "💡 Swerving to %d° corridor (Offset: %+.0f°) -> Heading: %.1f°",
+              bestAngle, angleOffset, targetAvoidHeading);
+          addLog(planBuf);
+          classAvoidRetries = 0;
+          avoidSubStep = 2;
+        } else {
+          // All 7 angles blocked
+          classAvoidRetries++;
+          char retryBuf[80];
+          snprintf(retryBuf, sizeof(retryBuf),
+                   "⚠️ All 7 sweep angles blocked (Attempt %d/5)...",
+                   classAvoidRetries);
+          addLog(retryBuf);
+
+          if (classAvoidRetries >= 5) {
+            addLog("🚨 DEADLOCK: 5 failed attempts! Stopping motors.");
+            stopMotors();
+            writeUltrasonicServo(90);
+            manualDriveState = MANUAL_IDLE;
+          } else {
+            addLog(
+                "⚠️ Reversing 1000ms (accel-verified) to open up clearance...");
+            verifiedBackupMs = 0;
+            backupLastMs = millis();
+            backupStartWallMs = millis();
+            avoidSubStep = 5; // Backup sub-step
+          }
+        }
+      }
+      break;
+
+    // Sub-step 2: Closed-Loop Gyro Heading Turn to Swerve Angle
+    case 2:
+      if (rotateToHeading(targetAvoidHeading)) {
+        stopMotors();
+        writeUltrasonicServo(90);
+        avoidSubTimer = millis();
+        avoidSubStep = 3;
+      }
+      break;
+
+    // Sub-step 3: Forward Bypass Drive (1.2s) & Real-time Obstacle Safety Check
+    case 3: {
+      writeUltrasonicServo(90);
+      float curDist = readUltrasonic();
+      if (curDist > 0 && curDist <= obstacleThresholdCm) {
+        stopMotors();
+        char obsWarn[96];
+        snprintf(
+            obsWarn, sizeof(obsWarn),
+            "🚨 Secondary obstacle ahead during bypass (%.1f cm)! Reversing...",
+            curDist);
+        addLog(obsWarn);
+        classAvoidRetries++;
+        if (classAvoidRetries >= 5) {
+          addLog("🚨 DEADLOCK: 5 failed attempts! Stopping motors.");
+          stopMotors();
+          manualDriveState = MANUAL_IDLE;
+        } else {
+          verifiedBackupMs = 0;
+          backupLastMs = millis();
+          backupStartWallMs = millis();
+          avoidSubStep = 5;
+        }
+        break;
+      }
+
+      moveForward(defaultDriveSpeed);
+      if (now - avoidSubTimer >= 1200) {
+        stopMotors();
+        writeUltrasonicServo(90);
+        addLog("✅ Obstacle bypassed! Resuming manual drive mode...");
+        manualDriveState = manualResumeState;
+      }
+      break;
+    }
+
+    // Sub-step 5: Accelerometer-Gated Reverse Backup (1000ms verified motion)
+    case 5: {
+      moveBackward(defaultDriveSpeed);
+      unsigned long dtMs = (backupLastMs == 0) ? 0 : (now - backupLastMs);
+      backupLastMs = now;
+
+      bool moving = isRobotMovingLinear();
+      if (moving && dtMs > 0 && dtMs < 500) {
+        verifiedBackupMs += dtMs;
+      }
+
+      if (verifiedBackupMs >= 1000 || (now - backupStartWallMs >= 3500)) {
+        stopMotors();
+        writeUltrasonicServo(90);
+        verifiedBackupMs = 0;
+        backupLastMs = 0;
+        avoidSubStep = 0; // Retry sweep
+        avoidSubTimer = millis();
+      }
+      break;
+    }
+    }
+    break;
+  }
   }
 }
 
@@ -1280,19 +2033,31 @@ float targetHeading = 0.0f;
 unsigned long classStepTimer = 0;
 unsigned long targetDurationMs = 0;
 unsigned long remainingMoveMs = 0;
+unsigned long accumulatedMoveMs =
+    0; // Accel-gated verified forward/reverse motion duration
+unsigned long lastClassMotionTickMs = 0; // Timestamp for motion delta-time
 
 ClassStep returnAfterAvoidStep = CLASS_CORRIDOR_DRIVE;
 float returnAfterAvoidHeading = 0.0f;
-int avoidSubStep = 0;
-int classAvoidRetries = 0;
-unsigned long avoidSubTimer = 0;
-float avoidLeftDist = -1.0f;
-float avoidRightDist = -1.0f;
 char autoStatusStr[32] = "IDLE";
 
 void processClassroomAuto() {
   if (currentMode != MODE_AUTONOMOUS)
     return;
+
+  // Hard Safety Interlock: MPU6050 must be connected
+  if (!mpuConnected) {
+    stopMotors();
+    strncpy(autoStatusStr, "HALTED: MPU DISCONNECTED", sizeof(autoStatusStr));
+    static unsigned long lastClassMpuWarn = 0;
+    if (millis() - lastClassMpuWarn >= 3000) {
+      lastClassMpuWarn = millis();
+      addLog("🚨 [SAFETY HALT] 3-Classroom Patrol halted — MPU6050 connection "
+             "lost!");
+    }
+    classStep = CLASS_MISSION_DONE;
+    return;
+  }
 
   unsigned long now = millis();
 
@@ -1300,8 +2065,11 @@ void processClassroomAuto() {
   static unsigned long lastClassLogMs = 0;
   if (now - lastClassLogMs >= 200) {
     lastClassLogMs = now;
-    Serial.printf("🏫 [CLASS AUTO] State: %-26s | Yaw: %6.1f° | Target: %6.1f° | CorridorBase: %6.1f° | Dist: %5.1f cm | Motor: %-8s (%d, %d)\n",
-                  autoStatusStr, currentYaw, targetHeading, corridorHeading, latestDistanceCm, currentMotorState, currentSpeedA, currentSpeedB);
+    Serial.printf(
+        "🏫 [CLASS AUTO] State: %-26s | Yaw: %6.1f° | Target: %6.1f° | "
+        "CorridorBase: %6.1f° | Dist: %5.1f cm | Motor: %-8s (%d, %d)\n",
+        autoStatusStr, currentYaw, targetHeading, corridorHeading,
+        latestDistanceCm, currentMotorState, currentSpeedA, currentSpeedB);
   }
 
   switch (classStep) {
@@ -1310,26 +2078,38 @@ void processClassroomAuto() {
     currentClassroom = 1;
     corridorHeading = currentYaw; // Baseline corridor heading
     targetHeading = corridorHeading;
-    targetDurationMs = 2000;      // 2 seconds forward
-    classStepTimer = now;
+    targetDurationMs = 2000; // 2 seconds forward
+    accumulatedMoveMs = 0;
+    lastClassMotionTickMs = millis();
     classAvoidRetries = 0;
     writeUltrasonicServo(90);
     writeCamServo(CAM_ANGLE_CENTER);
     addLog("🏫 Starting 3-Classroom Patrol Mission (Classroom 1/3)...");
-    addLog("🚗 [Room 1/3] Moving forward along corridor (2.0s)...");
+    addLog("🚗 [Room 1/3] Moving forward along corridor (2.0s verified)...");
     snprintf(autoStatusStr, sizeof(autoStatusStr), "ROOM 1/3 — CORRIDOR (2s)");
     classStep = CLASS_CORRIDOR_DRIVE;
     break;
 
-  // 1. Move Forward along corridor (2s)
-  case CLASS_CORRIDOR_DRIVE:
-    snprintf(autoStatusStr, sizeof(autoStatusStr), "ROOM %d/3 — CORRIDOR (2s)", currentClassroom);
+  // 1. Move Forward along corridor (2s verified motion)
+  case CLASS_CORRIDOR_DRIVE: {
+    snprintf(autoStatusStr, sizeof(autoStatusStr), "ROOM %d/3 — CORRIDOR (2s)",
+             currentClassroom);
     moveForward(defaultDriveSpeed);
+
+    unsigned long dtMs =
+        (lastClassMotionTickMs == 0) ? 0 : (now - lastClassMotionTickMs);
+    lastClassMotionTickMs = now;
+    bool isMoving = isRobotMovingLinear();
+    if (isMoving && dtMs > 0 && dtMs < 500) {
+      accumulatedMoveMs += dtMs;
+    }
 
     // Obstacle Check
     if (latestDistanceCm > 0 && latestDistanceCm <= obstacleThresholdCm) {
       stopMotors();
-      remainingMoveMs = (now - classStepTimer < targetDurationMs) ? (targetDurationMs - (now - classStepTimer)) : 100;
+      remainingMoveMs = (accumulatedMoveMs < targetDurationMs)
+                            ? (targetDurationMs - accumulatedMoveMs)
+                            : 100;
       returnAfterAvoidStep = CLASS_CORRIDOR_DRIVE;
       returnAfterAvoidHeading = corridorHeading;
       avoidSubStep = 0;
@@ -1340,36 +2120,55 @@ void processClassroomAuto() {
       break;
     }
 
-    if (now - classStepTimer >= targetDurationMs) {
+    if (accumulatedMoveMs >= targetDurationMs) {
       stopMotors();
-      targetHeading = corridorHeading + 90.0f; // Turn LEFT 90° into room (+90° CCW)
+      accumulatedMoveMs = 0;
+      lastClassMotionTickMs = millis();
+      targetHeading =
+          corridorHeading + 90.0f; // Turn LEFT 90° into room (+90° CCW)
       addLog("🚪 At classroom entrance. Turning LEFT 90° into room...");
-      snprintf(autoStatusStr, sizeof(autoStatusStr), "ROOM %d/3 — TURN LEFT 90°", currentClassroom);
+      snprintf(autoStatusStr, sizeof(autoStatusStr),
+               "ROOM %d/3 — TURN LEFT 90°", currentClassroom);
       classStep = CLASS_TURN_ROOM;
     }
     break;
+  }
 
   // 2. Turn Left 90° into Classroom
   case CLASS_TURN_ROOM:
-    snprintf(autoStatusStr, sizeof(autoStatusStr), "ROOM %d/3 — TURN LEFT 90°", currentClassroom);
+    snprintf(autoStatusStr, sizeof(autoStatusStr), "ROOM %d/3 — TURN LEFT 90°",
+             currentClassroom);
     if (rotateToHeading(targetHeading)) {
-      addLog("➡️ Heading locked! Moving forward into room (2.0s)...");
+      addLog("➡️ Heading locked! Moving forward into room (2.0s verified)...");
       targetDurationMs = 2000;
-      classStepTimer = millis();
-      snprintf(autoStatusStr, sizeof(autoStatusStr), "ROOM %d/3 — ENTERING (2s)", currentClassroom);
+      accumulatedMoveMs = 0;
+      lastClassMotionTickMs = millis();
+      snprintf(autoStatusStr, sizeof(autoStatusStr),
+               "ROOM %d/3 — ENTERING (2s)", currentClassroom);
       classStep = CLASS_ENTER_ROOM;
     }
     break;
 
-  // 3. Move Forward into Classroom (2s)
-  case CLASS_ENTER_ROOM:
-    snprintf(autoStatusStr, sizeof(autoStatusStr), "ROOM %d/3 — ENTERING (2s)", currentClassroom);
+  // 3. Move Forward into Classroom (2s verified motion)
+  case CLASS_ENTER_ROOM: {
+    snprintf(autoStatusStr, sizeof(autoStatusStr), "ROOM %d/3 — ENTERING (2s)",
+             currentClassroom);
     moveForward(defaultDriveSpeed);
+
+    unsigned long dtMs =
+        (lastClassMotionTickMs == 0) ? 0 : (now - lastClassMotionTickMs);
+    lastClassMotionTickMs = now;
+    bool isMoving = isRobotMovingLinear();
+    if (isMoving && dtMs > 0 && dtMs < 500) {
+      accumulatedMoveMs += dtMs;
+    }
 
     // Obstacle Check
     if (latestDistanceCm > 0 && latestDistanceCm <= obstacleThresholdCm) {
       stopMotors();
-      remainingMoveMs = (now - classStepTimer < targetDurationMs) ? (targetDurationMs - (now - classStepTimer)) : 100;
+      remainingMoveMs = (accumulatedMoveMs < targetDurationMs)
+                            ? (targetDurationMs - accumulatedMoveMs)
+                            : 100;
       returnAfterAvoidStep = CLASS_ENTER_ROOM;
       returnAfterAvoidHeading = targetHeading;
       avoidSubStep = 0;
@@ -1380,23 +2179,31 @@ void processClassroomAuto() {
       break;
     }
 
-    if (now - classStepTimer >= targetDurationMs) {
+    if (accumulatedMoveMs >= targetDurationMs) {
       stopMotors();
-      targetHeading = corridorHeading + 180.0f; // Turn 90° LEFT inside classroom (+90° room entry + 90° = +180°)
+      accumulatedMoveMs = 0;
+      lastClassMotionTickMs = millis();
+      targetHeading =
+          corridorHeading + 180.0f; // Turn 90° LEFT inside classroom (+90° room
+                                    // entry + 90° = +180°)
       addLog("🚪 Inside classroom. Turning 90° LEFT to present waste bin...");
-      snprintf(autoStatusStr, sizeof(autoStatusStr), "ROOM %d/3 — PRESENT BIN (90° L)", currentClassroom);
+      snprintf(autoStatusStr, sizeof(autoStatusStr),
+               "ROOM %d/3 — PRESENT BIN (90° L)", currentClassroom);
       classStep = CLASS_PRESENT_TURN;
     }
     break;
+  }
 
   // 4. Turn 90° Left to Present Bin in Classroom
   case CLASS_PRESENT_TURN:
-    snprintf(autoStatusStr, sizeof(autoStatusStr), "ROOM %d/3 — PRESENT BIN (90° L)", currentClassroom);
+    snprintf(autoStatusStr, sizeof(autoStatusStr),
+             "ROOM %d/3 — PRESENT BIN (90° L)", currentClassroom);
     if (rotateToHeading(targetHeading)) {
       stopMotors();
       classStepTimer = millis();
       addLog("🛑 Bin presented! Waiting 5.0s for waste disposal...");
-      snprintf(autoStatusStr, sizeof(autoStatusStr), "ROOM %d/3 — WAITING (5s)", currentClassroom);
+      snprintf(autoStatusStr, sizeof(autoStatusStr), "ROOM %d/3 — WAITING (5s)",
+               currentClassroom);
       classStep = CLASS_WAIT_DROP;
     }
     break;
@@ -1404,58 +2211,82 @@ void processClassroomAuto() {
   // 5. Wait 5s in Classroom for Waste Drop
   case CLASS_WAIT_DROP:
     stopMotors();
-    snprintf(autoStatusStr, sizeof(autoStatusStr), "ROOM %d/3 — WAITING (5s)", currentClassroom);
+    snprintf(autoStatusStr, sizeof(autoStatusStr), "ROOM %d/3 — WAITING (5s)",
+             currentClassroom);
     if (now - classStepTimer >= 5000) {
-      targetHeading = corridorHeading + 90.0f; // Turn 90° RIGHT back to room entry/exit heading
+      targetHeading = corridorHeading +
+                      90.0f; // Turn 90° RIGHT back to room entry/exit heading
       addLog("⏰ 5s elapsed! Turning 90° RIGHT to face room exit...");
-      snprintf(autoStatusStr, sizeof(autoStatusStr), "ROOM %d/3 — RESTORE HEADING", currentClassroom);
+      snprintf(autoStatusStr, sizeof(autoStatusStr),
+               "ROOM %d/3 — RESTORE HEADING", currentClassroom);
       classStep = CLASS_RESTORE_TURN;
     }
     break;
 
   // 6. Turn 90° Right back to Exit Heading
   case CLASS_RESTORE_TURN:
-    snprintf(autoStatusStr, sizeof(autoStatusStr), "ROOM %d/3 — RESTORE HEADING", currentClassroom);
+    snprintf(autoStatusStr, sizeof(autoStatusStr),
+             "ROOM %d/3 — RESTORE HEADING", currentClassroom);
     if (rotateToHeading(targetHeading)) {
       stopMotors();
       targetDurationMs = 2000;
-      classStepTimer = millis();
-      addLog("⬅️ Collection complete! Reversing out of room (2.0s)...");
-      snprintf(autoStatusStr, sizeof(autoStatusStr), "ROOM %d/3 — EXITING (2s)", currentClassroom);
+      accumulatedMoveMs = 0;
+      lastClassMotionTickMs = millis();
+      addLog("⬅️ Collection complete! Reversing out of room (2.0s verified)...");
+      snprintf(autoStatusStr, sizeof(autoStatusStr), "ROOM %d/3 — EXITING (2s)",
+               currentClassroom);
       classStep = CLASS_EXIT_ROOM;
     }
     break;
 
-  // 7. Move Backward out of Classroom (2s)
-  case CLASS_EXIT_ROOM:
-    snprintf(autoStatusStr, sizeof(autoStatusStr), "ROOM %d/3 — EXITING (2s)", currentClassroom);
+  // 7. Move Backward out of Classroom (2s verified motion)
+  case CLASS_EXIT_ROOM: {
+    snprintf(autoStatusStr, sizeof(autoStatusStr), "ROOM %d/3 — EXITING (2s)",
+             currentClassroom);
     moveBackward(defaultDriveSpeed);
 
-    if (now - classStepTimer >= targetDurationMs) {
+    unsigned long dtMs =
+        (lastClassMotionTickMs == 0) ? 0 : (now - lastClassMotionTickMs);
+    lastClassMotionTickMs = now;
+    bool isMoving = isRobotMovingLinear();
+    if (isMoving && dtMs > 0 && dtMs < 500) {
+      accumulatedMoveMs += dtMs;
+    }
+
+    if (accumulatedMoveMs >= targetDurationMs) {
       stopMotors();
-      targetHeading = corridorHeading; // Turn back right 90° to corridor baseline
+      accumulatedMoveMs = 0;
+      lastClassMotionTickMs = millis();
+      targetHeading =
+          corridorHeading; // Turn back right 90° to corridor baseline
       addLog("🔄 Reached corridor. Turning RIGHT 90° to face path...");
-      snprintf(autoStatusStr, sizeof(autoStatusStr), "ROOM %d/3 — TURN RIGHT 90°", currentClassroom);
+      snprintf(autoStatusStr, sizeof(autoStatusStr),
+               "ROOM %d/3 — TURN RIGHT 90°", currentClassroom);
       classStep = CLASS_TURN_CORRIDOR;
     }
     break;
+  }
 
   // 8. Turn Right 90° back to Corridor Heading
   case CLASS_TURN_CORRIDOR:
-    snprintf(autoStatusStr, sizeof(autoStatusStr), "ROOM %d/3 — TURN RIGHT 90°", currentClassroom);
+    snprintf(autoStatusStr, sizeof(autoStatusStr), "ROOM %d/3 — TURN RIGHT 90°",
+             currentClassroom);
     if (rotateToHeading(targetHeading)) {
       addLog("✅ Classroom visit completed!");
       currentClassroom++;
 
       if (currentClassroom <= 3) {
         targetDurationMs = 2000; // Next classroom forward 2s
-        classStepTimer = millis();
-        addLog("🏫 Moving forward to next classroom (2.0s)...");
-        snprintf(autoStatusStr, sizeof(autoStatusStr), "ROOM %d/3 — CORRIDOR (2s)", currentClassroom);
+        accumulatedMoveMs = 0;
+        lastClassMotionTickMs = millis();
+        addLog("🏫 Moving forward to next classroom (2.0s verified)...");
+        snprintf(autoStatusStr, sizeof(autoStatusStr),
+                 "ROOM %d/3 — CORRIDOR (2s)", currentClassroom);
         classStep = CLASS_CORRIDOR_DRIVE;
       } else {
         targetHeading = corridorHeading + 180.0f; // Turn 180° for return
-        addLog("🏁 All 3 classrooms visited! Turning 180° for Return Home Routine...");
+        addLog("🏁 All 3 classrooms visited! Turning 180° for Return Home "
+               "Routine...");
         strncpy(autoStatusStr, "TURNING 180° RETURN", sizeof(autoStatusStr));
         classStep = CLASS_RETURN_TURN;
       }
@@ -1467,22 +2298,34 @@ void processClassroomAuto() {
     strncpy(autoStatusStr, "TURNING 180° RETURN", sizeof(autoStatusStr));
     if (rotateToHeading(targetHeading)) {
       targetDurationMs = 6000; // 6 seconds return drive
-      classStepTimer = millis();
-      addLog("🚗 Returning home along corridor (Moving forward 6.0s)...");
+      accumulatedMoveMs = 0;
+      lastClassMotionTickMs = millis();
+      addLog(
+          "🚗 Returning home along corridor (Moving forward 6.0s verified)...");
       strncpy(autoStatusStr, "RETURNING HOME (6s)", sizeof(autoStatusStr));
       classStep = CLASS_RETURN_DRIVE;
     }
     break;
 
-  // 8. Return Drive (6s)
-  case CLASS_RETURN_DRIVE:
+  // 8. Return Drive (6s verified motion)
+  case CLASS_RETURN_DRIVE: {
     strncpy(autoStatusStr, "RETURNING HOME (6s)", sizeof(autoStatusStr));
     moveForward(defaultDriveSpeed);
+
+    unsigned long dtMs =
+        (lastClassMotionTickMs == 0) ? 0 : (now - lastClassMotionTickMs);
+    lastClassMotionTickMs = now;
+    bool isMoving = isRobotMovingLinear();
+    if (isMoving && dtMs > 0 && dtMs < 500) {
+      accumulatedMoveMs += dtMs;
+    }
 
     // Obstacle Check
     if (latestDistanceCm > 0 && latestDistanceCm <= obstacleThresholdCm) {
       stopMotors();
-      remainingMoveMs = (now - classStepTimer < targetDurationMs) ? (targetDurationMs - (now - classStepTimer)) : 100;
+      remainingMoveMs = (accumulatedMoveMs < targetDurationMs)
+                            ? (targetDurationMs - accumulatedMoveMs)
+                            : 100;
       returnAfterAvoidStep = CLASS_RETURN_DRIVE;
       returnAfterAvoidHeading = targetHeading;
       avoidSubStep = 0;
@@ -1493,14 +2336,18 @@ void processClassroomAuto() {
       break;
     }
 
-    if (now - classStepTimer >= targetDurationMs) {
+    if (accumulatedMoveMs >= targetDurationMs) {
       stopMotors();
-      targetHeading = corridorHeading; // Turn 180° back to original home orientation
+      accumulatedMoveMs = 0;
+      lastClassMotionTickMs = millis();
+      targetHeading =
+          corridorHeading; // Turn 180° back to original home orientation
       addLog("🏠 Reached home station. Aligning to original orientation...");
       strncpy(autoStatusStr, "ALIGNING HOME", sizeof(autoStatusStr));
       classStep = CLASS_RETURN_ALIGN;
     }
     break;
+  }
 
   // 9. Align to Home Heading
   case CLASS_RETURN_ALIGN:
@@ -1522,84 +2369,181 @@ void processClassroomAuto() {
     strncpy(autoStatusStr, "OBSTACLE AVOIDANCE", sizeof(autoStatusStr));
     switch (avoidSubStep) {
 
-    // Sub-step 0: Scan Left 120°
+    // Sub-step 0: Perform 7-Point Panoramic Radar Sweep (0° -> 180°) with 200ms
+    // dwell & 5-ping max filter
     case 0:
-      writeUltrasonicServo(120);
-      if (now - avoidSubTimer >= 300) {
-        avoidLeftDist = readUltrasonic();
-        writeUltrasonicServo(60); // Scan Right 60°
+      if (currentSweepIdx < 7) {
+        writeUltrasonicServo(SCAN_ANGLES[currentSweepIdx]);
+        unsigned long requiredDwell =
+            (currentSweepIdx == 0) ? 300
+                                   : 200; // 300ms for initial 0° repositioning
+        if (now - avoidSubTimer >= requiredDwell) {
+          sweepDistances[currentSweepIdx] = readUltrasonicMaxFilter(5, 15);
+          currentSweepIdx++;
+          avoidSubTimer = now;
+        }
+      } else {
+        // Full sweep completed! Immediately re-center servo to 90°
+        writeUltrasonicServo(90);
+        currentSweepIdx = 0;
         avoidSubTimer = now;
-        avoidSubStep = 1;
+        avoidSubStep = 1; // Advance to decision
       }
       break;
 
-    // Sub-step 1: Scan Right 60°
+    // Sub-step 1: Decision & Target Calculation
     case 1:
-      if (now - avoidSubTimer >= 300) {
-        avoidRightDist = readUltrasonic();
-        writeUltrasonicServo(90); // Re-center sonar
-        avoidSubTimer = now;
-        avoidSubStep = 2;
-      }
-      break;
-
-    // Sub-step 2: Decision & Swerve
-    case 2:
-      if (now - avoidSubTimer >= 250) {
-        float currentDist = readUltrasonic();
-        if (currentDist <= 0 || currentDist > obstacleThresholdCm) {
-          addLog("✅ Path is now clear — resuming patrol mission.");
+      if (now - avoidSubTimer >= 150) {
+        int bestAngle = evaluateSweepPath(sweepDistances, obstacleThresholdCm);
+        if (bestAngle == 90) {
+          addLog("✅ Path straight ahead is now clear — resuming patrol.");
+          writeUltrasonicServo(90);
           classStepTimer = millis() - (targetDurationMs - remainingMoveMs);
+          classAvoidRetries = 0;
           classStep = returnAfterAvoidStep;
+        } else if (bestAngle >= 0) {
+          float angleOffset =
+              (float)(bestAngle - 90); // e.g. 120° -> +30°, 60° -> -30°
+          targetAvoidHeading = currentYaw + angleOffset;
+          char planBuf[96];
+          snprintf(planBuf, sizeof(planBuf),
+                   "💡 Swerving to %d° corridor (Offset: %+.0f°) -> Target "
+                   "Heading: %.1f°",
+                   bestAngle, angleOffset, targetAvoidHeading);
+          addLog(planBuf);
+          classAvoidRetries = 0;
+          avoidSubStep = 2; // Advance to closed-loop angle turn
         } else {
+          // All 7 angles blocked
           classAvoidRetries++;
-          if (classAvoidRetries >= 3) {
-            addLog("⚠️ Obstacle blocking path after 3 attempts — backing up...");
-            moveBackward(defaultDriveSpeed);
-            delay(1000);
-            stopMotors();
-            classAvoidRetries = 0;
-            avoidSubStep = 0;
-            avoidSubTimer = millis();
-          } else {
-            float l = (avoidLeftDist <= 0) ? 999.0f : avoidLeftDist;
-            float r = (avoidRightDist <= 0) ? 999.0f : avoidRightDist;
+          char retryBuf[80];
+          snprintf(retryBuf, sizeof(retryBuf),
+                   "⚠️ All 7 sweep angles blocked (Attempt %d/5)...",
+                   classAvoidRetries);
+          addLog(retryBuf);
 
-            if (l > r && l > obstacleThresholdCm) {
-              addLog("💡 Swerving LEFT around obstacle");
-              turnLeft(turnLeftSpeed);
-              avoidSubTimer = now;
-              avoidSubStep = 3;
-            } else if (r >= l && r > obstacleThresholdCm) {
-              addLog("💡 Swerving RIGHT around obstacle");
-              turnRight(turnRightSpeed);
-              avoidSubTimer = now;
-              avoidSubStep = 3;
-            } else {
-              addLog("⚠️ Both sides narrow — backing up...");
-              moveBackward(defaultDriveSpeed);
-              avoidSubTimer = now;
-              avoidSubStep = 3;
-            }
+          if (classAvoidRetries >= 5) {
+            addLog("🚨 DEADLOCK: 5 failed attempts! Turning 180° LEFT and "
+                   "pausing mission...");
+            targetAvoidHeading = currentYaw + 180.0f;
+            avoidSubStep = 6; // Deadlock 180° turn sub-step
+          } else {
+            addLog("⚠️ Path completely blocked — reversing 1000ms "
+                   "(accel-verified) to re-scan...");
+            verifiedBackupMs = 0;
+            backupLastMs = millis();
+            backupStartWallMs = millis();
+            avoidSubStep = 5; // Accel-gated backup sub-step
           }
         }
       }
       break;
 
-    // Sub-step 3: Complete Swerve & Re-orient
-    case 3:
-      if (now - avoidSubTimer >= 350) {
+    // Sub-step 2: Closed-Loop Gyro Heading Turn to Swerve Angle
+    case 2:
+      if (rotateToHeading(targetAvoidHeading)) {
         stopMotors();
-        avoidSubStep = 4;
+        writeUltrasonicServo(90); // Guarantee sensor is looking straight ahead
+        avoidSubTimer = millis();
+        avoidSubStep = 3; // Advance to bypass drive
       }
       break;
 
-    // Sub-step 4: Rotate back to mission heading
+    // Sub-step 3: Forward Bypass Drive (1.2s) & Real-time Obstacle Safety Check
+    case 3: {
+      writeUltrasonicServo(90); // Keep looking dead ahead
+
+      // Real-time obstacle check while on bypass movement before re-alignment!
+      float curDist = readUltrasonic();
+      if (curDist > 0 && curDist <= obstacleThresholdCm) {
+        stopMotors();
+        char obsWarn[96];
+        snprintf(obsWarn, sizeof(obsWarn),
+                 "🚨 Secondary obstacle ahead during bypass drive (%.1f cm)! "
+                 "Reversing to clear...",
+                 curDist);
+        addLog(obsWarn);
+        classAvoidRetries++;
+        if (classAvoidRetries >= 5) {
+          addLog("🚨 DEADLOCK: 5 failed attempts! Turning 180° LEFT and "
+                 "pausing mission...");
+          targetAvoidHeading = currentYaw + 180.0f;
+          avoidSubStep = 6; // 180° escape & pause
+        } else {
+          verifiedBackupMs = 0;
+          backupLastMs = millis();
+          backupStartWallMs = millis();
+          avoidSubStep = 5; // Back up 1000ms
+        }
+        break;
+      }
+
+      moveForward(defaultDriveSpeed);
+      if (now - avoidSubTimer >= 1200) {
+        stopMotors();
+        writeUltrasonicServo(90);
+        addLog("🔄 Obstacle bypassed! Re-aligning to mission heading...");
+        avoidSubStep = 4; // Advance to re-alignment
+      }
+      break;
+    }
+
+    // Sub-step 4: Re-Align to Original Mission Heading
     case 4:
+      writeUltrasonicServo(90);
       if (rotateToHeading(returnAfterAvoidHeading)) {
+        stopMotors();
+        writeUltrasonicServo(90);
         addLog("✅ Re-aligned to mission path. Resuming drive...");
-        classStepTimer = millis() - (targetDurationMs - remainingMoveMs);
+        accumulatedMoveMs = (remainingMoveMs < targetDurationMs)
+                                ? (targetDurationMs - remainingMoveMs)
+                                : 0;
+        lastClassMotionTickMs = millis();
         classStep = returnAfterAvoidStep;
+      }
+      break;
+
+    // Sub-step 5: Accelerometer-Gated Reverse Backup (1000ms verified motion)
+    case 5: {
+      moveBackward(defaultDriveSpeed);
+      unsigned long dtMs = (backupLastMs == 0) ? 0 : (now - backupLastMs);
+      backupLastMs = now;
+
+      bool moving = isRobotMovingLinear();
+      if (moving && dtMs > 0 && dtMs < 500) {
+        verifiedBackupMs += dtMs;
+      }
+
+      static unsigned long lastClassLogMs = 0;
+      if (now - lastClassLogMs >= 250) {
+        lastClassLogMs = now;
+        Serial.printf("⚡ [PATROL BACKUP] Motion: %s (Jerk: %.3f) | Verified: "
+                      "%lu/1000ms | PWM: %d\n",
+                      moving ? "MOVING" : "STALLED/SLIP", currentAccelJerk,
+                      verifiedBackupMs, currentSpeedA);
+      }
+
+      if (verifiedBackupMs >= 1000 || (now - backupStartWallMs >= 3500)) {
+        stopMotors();
+        writeUltrasonicServo(90);
+        verifiedBackupMs = 0;
+        backupLastMs = 0;
+        avoidSubStep = 0; // Retry sweep
+        avoidSubTimer = millis();
+      }
+      break;
+    }
+
+    // Sub-step 6: Deadlock Escape 180° Turn & Pause Mission
+    case 6:
+      if (rotateToHeading(targetAvoidHeading)) {
+        stopMotors();
+        writeUltrasonicServo(90);
+        classAvoidRetries = 0;
+        addLog("🛑 Deadlock escape complete (180° Left turn). Mission PAUSED — "
+               "click 'Start Mission' to resume.");
+        strncpy(autoStatusStr, "PAUSED (DEADLOCK)", sizeof(autoStatusStr));
+        classStep = CLASS_MISSION_DONE;
       }
       break;
     }
@@ -1669,6 +2613,15 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     <p>ESP32 SoftAP Dashboard &nbsp;|&nbsp; Real-Time Telemetry &nbsp;|&nbsp; Manual · Autonomous · CAM Guided</p>
   </header>
 
+  <!-- MPU6050 Disconnect Alert Banner -->
+  <div id="mpu-disconnect-banner" style="display:none;background:rgba(218,54,51,0.22);border:1px solid #da3633;color:#ff7b72;padding:12px 16px;border-radius:10px;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px">
+    <div>
+      <strong style="font-size:0.95rem">🚨 MPU6050 Gyroscope DISCONNECTED!</strong>
+      <div style="font-size:.82rem;color:#c9d1d9;margin-top:2px">All motor operations and autonomous modes are HALTED for safety. Check I2C wiring (SDA=21, SCL=22).</div>
+    </div>
+    <button class="btn-sm" style="background:#238636;color:#fff;padding:7px 16px;font-size:.85rem" onclick="recoverMPU()">🔄 Re-connect MPU</button>
+  </div>
+
   <!-- Mode Tabs -->
   <div class="tabs">
     <button class="tab-btn active" id="tab-manual-btn" onclick="switchMode('manual')">🎮 Manual Control</button>
@@ -1684,7 +2637,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       <div class="stat-val" id="tele-cam-link"><span class="badge" style="background:rgba(218,54,51,0.25);color:#da3633;border:1px solid #da3633">🔴 NO ACK</span></div></div>
     <div class="stat-box"><div class="stat-label">Obstacle Distance</div>
       <div class="stat-val" id="tele-dist">-- cm</div></div>
-    <div class="stat-box"><div class="stat-label">MPU Yaw</div>
+    <div class="stat-box"><div class="stat-label">MPU6050 &amp; Yaw</div>
       <div class="stat-val" id="tele-yaw">0.0°</div></div>
     <div class="stat-box"><div class="stat-label">Motor State</div>
       <div class="stat-val" id="tele-motor">STOPPED</div></div>
@@ -1696,13 +2649,13 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       <div class="card">
         <h2>🎮 Driving Controls</h2>
         <div class="dpad-container">
-          <button class="btn" onmousedown="drv('forward')" onmouseup="drv('stop')" ontouchstart="drv('forward')" ontouchend="drv('stop')">▲ FORWARD</button>
+          <button class="btn" onclick="drv('forward')">▲ FORWARD</button>
           <div class="dpad-row">
-            <button class="btn" onmousedown="drv('left')" onmouseup="drv('stop')" ontouchstart="drv('left')" ontouchend="drv('stop')">◀ LEFT</button>
+            <button class="btn" onclick="drv('left')">↺ CIRCLE LEFT</button>
             <button class="btn btn-stop" onclick="drv('stop')">🛑 STOP</button>
-            <button class="btn" onmousedown="drv('right')" onmouseup="drv('stop')" ontouchstart="drv('right')" ontouchend="drv('stop')">RIGHT ▶</button>
+            <button class="btn" onclick="drv('right')">CIRCLE RIGHT ↻</button>
           </div>
-          <button class="btn" onmousedown="drv('backward')" onmouseup="drv('stop')" ontouchstart="drv('backward')" ontouchend="drv('stop')">▼ BACKWARD</button>
+          <button class="btn" onclick="drv('backward')">▼ BACKWARD</button>
         </div>
       </div>
 
@@ -1799,7 +2752,11 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     <div class="card">
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:11px;flex-wrap:wrap;gap:8px">
         <h2>🏫 3-Classroom Autonomous Patrol</h2>
-        <button class="btn-sm" style="background:var(--red)" onclick="switchMode('manual')">🛑 Stop Mission</button>
+        <div style="display:flex;gap:8px">
+          <button id="btn-start-auto" class="btn-sm" style="background:#238636;color:#fff;padding:8px 16px;font-size:.88rem" onclick="startClassroomMission()">▶ Start Mission</button>
+          <button id="btn-stop-auto" class="btn-sm" style="background:var(--red);color:#fff;padding:8px 16px;font-size:.88rem" onclick="stopClassroomMission()">🛑 Stop / Pause</button>
+          <button class="btn-sm" style="background:#21262d;color:#8b949e" onclick="switchMode('manual')">Exit to Manual</button>
+        </div>
       </div>
       <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(140px,1fr));margin-bottom:14px">
         <div class="stat-box"><div class="stat-label">Mission Stage</div>
@@ -1858,6 +2815,18 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     document.getElementById('tab-cam-btn').className    = 'tab-btn'+(mode==='cam'   ?' active-cam':'');
   }
   document.getElementById('manual-view').style.display = 'block';
+
+  function startClassroomMission() {
+    fetch('/api/cmd?start_auto=1').then(r=>r.json()).then(updateUI);
+  }
+
+  function stopClassroomMission() {
+    fetch('/api/cmd?stop_auto=1').then(r=>r.json()).then(updateUI);
+  }
+
+  function recoverMPU() {
+    fetch('/api/cmd?recover_mpu=1').then(r=>r.json()).then(updateUI);
+  }
 
   function camPauseToggle(pause) {
     camIsPaused = pause;
@@ -1950,13 +2919,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     if (e.key === 's' || e.key === 'S') drv('backward');
     if (e.key === 'a' || e.key === 'A') drv('left');
     if (e.key === 'd' || e.key === 'D') drv('right');
-    if (e.key === ' ') drv('stop');
-  });
-
-  document.addEventListener('keyup', e => {
-    if (['INPUT', 'TEXTAREA', 'SELECT'].includes(e.target.tagName) || e.target.isContentEditable) return;
-    if (uiMode !== 'manual') return;
-    if (['w', 'W', 's', 'S', 'a', 'A', 'd', 'D'].includes(e.key)) drv('stop');
+    if (e.key === ' ' || e.key === 'Escape') drv('stop');
   });
 
   let slidersInitialized = false;
@@ -2000,8 +2963,23 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     if(d.mode==='CAM_GUIDED') mb='<span class="badge badge-cam">CAM GUIDED</span>';
     document.getElementById('tele-mode').innerHTML = mb;
     document.getElementById('tele-dist').innerText  = d.ultrasonic>=0 ? d.ultrasonic.toFixed(1)+' cm' : 'Out of Range';
-    document.getElementById('tele-yaw').innerText   = (d.mpu_yaw>=0?'+':'')+d.mpu_yaw.toFixed(1)+'°';
     document.getElementById('tele-motor').innerText = d.motor_state;
+
+    if (d.mpu_connected !== undefined) {
+      let mpuOk = d.mpu_connected;
+      let banner = document.getElementById('mpu-disconnect-banner');
+      if (banner) banner.style.display = mpuOk ? 'none' : 'flex';
+      let yawEl = document.getElementById('tele-yaw');
+      if (yawEl) {
+        if (mpuOk) {
+          yawEl.innerHTML = '<span style="color:#34d399;font-size:0.82rem">🟢 </span>' + (d.mpu_yaw>=0?'+':'') + d.mpu_yaw.toFixed(1) + '°';
+        } else {
+          yawEl.innerHTML = '<span class="badge" style="background:rgba(218,54,51,0.3);color:#ff7b72;border:1px solid #da3633">🔴 DISCONNECTED</span>';
+        }
+      }
+    } else {
+      document.getElementById('tele-yaw').innerText   = (d.mpu_yaw>=0?'+':'')+d.mpu_yaw.toFixed(1)+'°';
+    }
 
     if(d.cam_online !== undefined) {
       const el = document.getElementById('tele-cam-link');
@@ -2061,86 +3039,67 @@ void handleTelemetry() {
     modeStr = "CAM_GUIDED";
 
   bool camOnline = (lastCamRxMs > 0 && (millis() - lastCamRxMs < 4000));
-  float camAgoSec = (lastCamRxMs > 0) ? ((millis() - lastCamRxMs) / 1000.0f) : 999.0f;
+  float camAgoSec =
+      (lastCamRxMs > 0) ? ((millis() - lastCamRxMs) / 1000.0f) : 999.0f;
 
-  const char *orientStr = (robotOrientation == ORIENTATION_FRONT) ? "FRONT" : "REAR";
-  char cycleStr[16] = "--";
-  if (cgSub == CG_SCANNING_CYCLE) {
-    snprintf(cycleStr, sizeof(cycleStr), "%d of 2", currentCycle);
-  }
-  const char *panStr = (cgSub == CG_SCANNING_CYCLE) ? getStepName(currentStep) : "CENTER (90°)";
+  const char *orientStr = "AHEAD (90°)";
+  const char *cycleStr =
+      (cgSub == CG_SCAN_CHECK || cgSub == CG_SCAN_TURN_90) ? "90° SCAN" : "--";
+  const char *panStr = "CENTER (90°)";
 
   static char jsonBuf[2048];
   int pos = 0;
-  pos += snprintf(jsonBuf + pos, sizeof(jsonBuf) - pos,
-    "{"
-    "\"mode\":\"%s\","
-    "\"cam_online\":%s,"
-    "\"cam_ago\":%.1f,"
-    "\"auto_sub\":\"%s\","
-    "\"classroom\":%d,"
-    "\"ultrasonic\":%.1f,"
-    "\"mpu_yaw\":%.2f,"
-    "\"motor_state\":\"%s\","
-    "\"drive_speed\":%d,"
-    "\"turn_left_speed\":%d,"
-    "\"turn_right_speed\":%d,"
-    "\"stall_interval\":%lu,"
-    "\"stall_boost_left\":%d,"
-    "\"stall_boost_right\":%d,"
-    "\"stall_boost_drive\":%d,"
-    "\"threshold\":%.1f,"
-    "\"gain\":%d,"
-    "\"tolerance\":%.1f,"
-    "\"laptop_ip\":\"%s\","
-    "\"wifi_ssid\":\"%s\","
-    "\"us_servo\":%d,"
-    "\"cam_state\":%d,"
-    "\"cam_angle\":%d,"
-    "\"cam_sub\":\"%s\","
-    "\"robot_facing\":\"%s\","
-    "\"scan_cycle\":\"%s\","
-    "\"cam_pan\":\"%s\","
-    "\"cam_paused\":%s,"
-    "\"total_logs\":%d,"
-    "\"logs\":[",
-    modeStr,
-    camOnline ? "true" : "false",
-    camAgoSec,
-    autoStatusStr,
-    currentClassroom,
-    latestDistanceCm,
-    currentYaw,
-    currentMotorState,
-    defaultDriveSpeed,
-    turnLeftSpeed,
-    turnRightSpeed,
-    stallCheckIntervalMs,
-    stallBoostLeft,
-    stallBoostRight,
-    stallBoostDrive,
-    obstacleThresholdCm,
-    camSteerGain,
-    headingToleranceDeg,
-    currentLaptopIp,
-    currentWifiSsid,
-    ultrasonicAngle,
-    lastCamPkt.state,
-    lastCamPkt.angleOffset,
-    camStateStr,
-    orientStr,
-    cycleStr,
-    panStr,
-    camPaused ? "true" : "false",
-    totalLogsAdded
-  );
+  pos += snprintf(
+      jsonBuf + pos, sizeof(jsonBuf) - pos,
+      "{"
+      "\"mode\":\"%s\","
+      "\"cam_online\":%s,"
+      "\"cam_ago\":%.1f,"
+      "\"mpu_connected\":%s,"
+      "\"auto_sub\":\"%s\","
+      "\"classroom\":%d,"
+      "\"ultrasonic\":%.1f,"
+      "\"mpu_yaw\":%.2f,"
+      "\"motor_state\":\"%s\","
+      "\"drive_speed\":%d,"
+      "\"turn_left_speed\":%d,"
+      "\"turn_right_speed\":%d,"
+      "\"stall_interval\":%lu,"
+      "\"stall_boost_left\":%d,"
+      "\"stall_boost_right\":%d,"
+      "\"stall_boost_drive\":%d,"
+      "\"threshold\":%.1f,"
+      "\"gain\":%d,"
+      "\"tolerance\":%.1f,"
+      "\"laptop_ip\":\"%s\","
+      "\"wifi_ssid\":\"%s\","
+      "\"us_servo\":%d,"
+      "\"cam_state\":%d,"
+      "\"cam_angle\":%d,"
+      "\"cam_sub\":\"%s\","
+      "\"robot_facing\":\"%s\","
+      "\"scan_cycle\":\"%s\","
+      "\"cam_pan\":\"%s\","
+      "\"cam_paused\":%s,"
+      "\"total_logs\":%d,"
+      "\"logs\":[",
+      modeStr, camOnline ? "true" : "false", camAgoSec,
+      mpuConnected ? "true" : "false", autoStatusStr, currentClassroom,
+      latestDistanceCm, currentYaw, currentMotorState, defaultDriveSpeed,
+      turnLeftSpeed, turnRightSpeed, stallCheckIntervalMs, stallBoostLeft,
+      stallBoostRight, stallBoostDrive, obstacleThresholdCm, camSteerGain,
+      headingToleranceDeg, currentLaptopIp, currentWifiSsid, ultrasonicAngle,
+      lastCamPkt.state, lastCamPkt.angleOffset, camStateStr, orientStr,
+      cycleStr, panStr, camPaused ? "true" : "false", totalLogsAdded);
 
   int count = (totalLogsAdded < MAX_LOGS) ? totalLogsAdded : MAX_LOGS;
   int startIdx = (totalLogsAdded < MAX_LOGS) ? 0 : logHead;
   for (int i = 0; i < count; i++) {
     int idx = (startIdx + i) % MAX_LOGS;
-    pos += snprintf(jsonBuf + pos, sizeof(jsonBuf) - pos, "\"%s\"%s", decisionLogs[idx], (i < count - 1) ? "," : "");
-    if (pos >= (int)sizeof(jsonBuf) - 10) break;
+    pos += snprintf(jsonBuf + pos, sizeof(jsonBuf) - pos, "\"%s\"%s",
+                    decisionLogs[idx], (i < count - 1) ? "," : "");
+    if (pos >= (int)sizeof(jsonBuf) - 10)
+      break;
   }
 
   snprintf(jsonBuf + pos, sizeof(jsonBuf) - pos, "]}");
@@ -2150,16 +3109,38 @@ void handleTelemetry() {
 void handleCommand() {
   lastManualCmdMs = millis();
 
+  if (server.hasArg("recover_mpu")) {
+    resetI2C();
+    if (mpuConnected) {
+      calibrateMPU();
+      addLog("✅ [WEB] MPU6050 recovered and calibrated successfully!");
+    } else {
+      addLog("❌ [WEB] MPU6050 recovery failed — check hardware wiring "
+             "(SDA=21, SCL=22).");
+    }
+    broadcastMode();
+  }
+
   if (server.hasArg("mode")) {
     String m = server.arg("mode");
+    if (!mpuConnected && m != "manual") {
+      stopMotors();
+      addLog("❌ [SAFETY REJECT] Cannot switch to autonomous/cam mode — "
+             "MPU6050 is DISCONNECTED!");
+      server.send(400, "application/json",
+                  "{\"error\":\"MPU6050 is disconnected!\"}");
+      return;
+    }
     if (m == "auto") {
       currentMode = MODE_AUTONOMOUS;
       classStep = CLASS_INIT;
+      classAvoidRetries = 0;
       camPaused = false;
       addLog("🔄 Mode → AUTONOMOUS (3-Classroom Patrol)");
     } else if (m == "cam") {
       currentMode = MODE_CAM_GUIDED;
       cgSub = CG_IDLE;
+      cgAvoidRetries = 0;
       camPaused = false;
       strncpy(camStateStr, "IDLE", sizeof(camStateStr));
       addLog("🔄 Mode → CAM GUIDED (Vision Node)");
@@ -2169,6 +3150,31 @@ void handleCommand() {
       stopMotors();
       addLog("🔄 Mode → MANUAL");
     }
+    broadcastMode();
+  }
+
+  if (server.hasArg("start_auto")) {
+    if (!mpuConnected) {
+      stopMotors();
+      addLog("❌ [SAFETY REJECT] Cannot start 3-Classroom Mission — MPU6050 is "
+             "DISCONNECTED!");
+      server.send(400, "application/json",
+                  "{\"error\":\"MPU6050 is disconnected!\"}");
+      return;
+    }
+    currentMode = MODE_AUTONOMOUS;
+    classStep = CLASS_INIT;
+    classAvoidRetries = 0;
+    camPaused = false;
+    addLog("▶ [WEB] Starting 3-Classroom Patrol Mission...");
+    broadcastMode();
+  }
+
+  if (server.hasArg("stop_auto")) {
+    stopMotors();
+    classStep = CLASS_MISSION_DONE;
+    strncpy(autoStatusStr, "STOPPED / PAUSED", sizeof(autoStatusStr));
+    addLog("⏸️ [WEB] 3-Classroom Patrol Mission stopped / paused.");
     broadcastMode();
   }
 
@@ -2188,20 +3194,22 @@ void handleCommand() {
   if (currentMode == MODE_MANUAL && server.hasArg("dir")) {
     String dir = server.arg("dir");
     if (dir == "forward") {
-      if (latestDistanceCm > 0 && latestDistanceCm < obstacleThresholdCm) {
-        stopMotors();
-        addLog("🚨 Obstacle in front — cannot advance!");
-      } else {
-        moveForward();
-      }
+      manualDriveState = MANUAL_DRIVE_FORWARD;
+      addLog("▶ [MANUAL] Cruising FORWARD (Auto obstacle avoidance active)");
     } else if (dir == "backward") {
-      moveBackward();
+      manualDriveState = MANUAL_DRIVE_BACKWARD;
+      addLog("▶ [MANUAL] Cruising BACKWARD");
     } else if (dir == "left") {
-      turnLeft();
+      manualDriveState = MANUAL_DRIVE_CIRCLE_LEFT;
+      addLog("↺ [MANUAL] Circling LEFT (Auto obstacle avoidance active)");
     } else if (dir == "right") {
-      turnRight();
+      manualDriveState = MANUAL_DRIVE_CIRCLE_RIGHT;
+      addLog("↻ [MANUAL] Circling RIGHT (Auto obstacle avoidance active)");
     } else if (dir == "stop") {
+      manualDriveState = MANUAL_IDLE;
       stopMotors();
+      writeUltrasonicServo(90);
+      addLog("🛑 [MANUAL] Motors STOPPED by user.");
     }
   }
 
@@ -2218,23 +3226,30 @@ void handleCommand() {
 
 void loadSettings() {
   prefs.begin("robot_cfg", true); // Read-only
-  defaultDriveSpeed   = prefs.getInt("drive_spd", 110);
-  turnLeftSpeed       = prefs.getInt("turn_l_spd", prefs.getInt("turn_spd", 180));
-  turnRightSpeed      = prefs.getInt("turn_r_spd", prefs.getInt("turn_spd", 210));
+  defaultDriveSpeed = prefs.getInt("drive_spd", 110);
+  turnLeftSpeed = prefs.getInt("turn_l_spd", prefs.getInt("turn_spd", 180));
+  turnRightSpeed = prefs.getInt("turn_r_spd", prefs.getInt("turn_spd", 210));
   obstacleThresholdCm = prefs.getFloat("obs_thresh", 50.0f);
-  camSteerGain        = prefs.getInt("steer_gain", 2);
+  camSteerGain = prefs.getInt("steer_gain", 2);
   headingToleranceDeg = prefs.getFloat("head_tol", 12.0f);
   stallCheckIntervalMs = (unsigned long)prefs.getInt("stall_int", 500);
   if (stallCheckIntervalMs < 100 || stallCheckIntervalMs > 5000)
     stallCheckIntervalMs = 500;
   if (headingToleranceDeg < 1.0f || headingToleranceDeg > 45.0f)
     headingToleranceDeg = 12.0f;
-  if (prefs.isKey("laptop_ip")) prefs.getString("laptop_ip", currentLaptopIp, sizeof(currentLaptopIp));
-  if (prefs.isKey("wifi_ssid")) prefs.getString("wifi_ssid", currentWifiSsid, sizeof(currentWifiSsid));
-  if (prefs.isKey("wifi_pass")) prefs.getString("wifi_pass", currentWifiPass, sizeof(currentWifiPass));
+  if (prefs.isKey("laptop_ip"))
+    prefs.getString("laptop_ip", currentLaptopIp, sizeof(currentLaptopIp));
+  if (prefs.isKey("wifi_ssid"))
+    prefs.getString("wifi_ssid", currentWifiSsid, sizeof(currentWifiSsid));
+  if (prefs.isKey("wifi_pass"))
+    prefs.getString("wifi_pass", currentWifiPass, sizeof(currentWifiPass));
   prefs.end();
-  Serial.printf("📦 Loaded from EEPROM/NVS: Drive=%d, TurnL=%d, TurnR=%d, StallInt=%lums, Thresh=%.1fcm, Gain=%d, HeadTol=%.1f°, LaptopIP=%s, SSID='%s'\n",
-                defaultDriveSpeed, turnLeftSpeed, turnRightSpeed, stallCheckIntervalMs, obstacleThresholdCm, camSteerGain, headingToleranceDeg, currentLaptopIp, currentWifiSsid);
+  Serial.printf("📦 Loaded from EEPROM/NVS: Drive=%d, TurnL=%d, TurnR=%d, "
+                "StallInt=%lums, Thresh=%.1fcm, Gain=%d, HeadTol=%.1f°, "
+                "LaptopIP=%s, SSID='%s'\n",
+                defaultDriveSpeed, turnLeftSpeed, turnRightSpeed,
+                stallCheckIntervalMs, obstacleThresholdCm, camSteerGain,
+                headingToleranceDeg, currentLaptopIp, currentWifiSsid);
 }
 
 void saveSettings() {
@@ -2259,17 +3274,21 @@ void handleSettings() {
 
   if (server.hasArg("drive_speed")) {
     int v = server.arg("drive_speed").toInt();
-    if (v >= 40 && v <= 255) defaultDriveSpeed = v;
+    if (v >= 40 && v <= 255)
+      defaultDriveSpeed = v;
   }
   if (server.hasArg("turn_left_speed")) {
     int v = server.arg("turn_left_speed").toInt();
-    if (v >= 50 && v <= 255) turnLeftSpeed = v;
+    if (v >= 50 && v <= 255)
+      turnLeftSpeed = v;
   }
   if (server.hasArg("turn_right_speed")) {
     int v = server.arg("turn_right_speed").toInt();
-    if (v >= 50 && v <= 255) turnRightSpeed = v;
+    if (v >= 50 && v <= 255)
+      turnRightSpeed = v;
   }
-  if (server.hasArg("turn_speed") && !server.hasArg("turn_left_speed") && !server.hasArg("turn_right_speed")) {
+  if (server.hasArg("turn_speed") && !server.hasArg("turn_left_speed") &&
+      !server.hasArg("turn_right_speed")) {
     int v = server.arg("turn_speed").toInt();
     if (v >= 50 && v <= 255) {
       turnLeftSpeed = v;
@@ -2278,25 +3297,30 @@ void handleSettings() {
   }
   if (server.hasArg("threshold")) {
     float v = server.arg("threshold").toFloat();
-    if (v >= 10.0f && v <= 200.0f) obstacleThresholdCm = v;
+    if (v >= 10.0f && v <= 200.0f)
+      obstacleThresholdCm = v;
   }
   if (server.hasArg("gain")) {
     int v = server.arg("gain").toInt();
-    if (v >= 1 && v <= 10) camSteerGain = v;
+    if (v >= 1 && v <= 10)
+      camSteerGain = v;
   }
   if (server.hasArg("tolerance")) {
     float v = server.arg("tolerance").toFloat();
-    if (v >= 1.0f && v <= 45.0f) headingToleranceDeg = v;
+    if (v >= 1.0f && v <= 45.0f)
+      headingToleranceDeg = v;
   }
   if (server.hasArg("stall_interval")) {
     int v = server.arg("stall_interval").toInt();
-    if (v >= 100 && v <= 5000) stallCheckIntervalMs = (unsigned long)v;
+    if (v >= 100 && v <= 5000)
+      stallCheckIntervalMs = (unsigned long)v;
   }
 
   if (server.hasArg("laptop_ip")) {
     String lip = server.arg("laptop_ip");
     lip.trim();
-    if (lip.length() >= 7 && strncmp(currentLaptopIp, lip.c_str(), sizeof(currentLaptopIp)) != 0) {
+    if (lip.length() >= 7 &&
+        strncmp(currentLaptopIp, lip.c_str(), sizeof(currentLaptopIp)) != 0) {
       strncpy(currentLaptopIp, lip.c_str(), sizeof(currentLaptopIp));
       netChanged = true;
     }
@@ -2304,7 +3328,8 @@ void handleSettings() {
   if (server.hasArg("wifi_ssid")) {
     String wssid = server.arg("wifi_ssid");
     wssid.trim();
-    if (wssid.length() > 0 && strncmp(currentWifiSsid, wssid.c_str(), sizeof(currentWifiSsid)) != 0) {
+    if (wssid.length() > 0 &&
+        strncmp(currentWifiSsid, wssid.c_str(), sizeof(currentWifiSsid)) != 0) {
       strncpy(currentWifiSsid, wssid.c_str(), sizeof(currentWifiSsid));
       netChanged = true;
       wifiChanged = true;
@@ -2313,7 +3338,8 @@ void handleSettings() {
   if (server.hasArg("wifi_pass")) {
     String wpass = server.arg("wifi_pass");
     wpass.trim();
-    if (wpass.length() > 0 && strncmp(currentWifiPass, wpass.c_str(), sizeof(currentWifiPass)) != 0) {
+    if (wpass.length() > 0 &&
+        strncmp(currentWifiPass, wpass.c_str(), sizeof(currentWifiPass)) != 0) {
       strncpy(currentWifiPass, wpass.c_str(), sizeof(currentWifiPass));
       netChanged = true;
       wifiChanged = true;
@@ -2325,17 +3351,23 @@ void handleSettings() {
   if (netChanged) {
     broadcastMode(1); // Broadcast full config sync to ESP32-CAM via UDP!
     char netLog[128];
-    snprintf(netLog, sizeof(netLog), "📡 Config synced to Camera: Laptop IP=%s, Wi-Fi='%s'", currentLaptopIp, currentWifiSsid);
+    snprintf(netLog, sizeof(netLog),
+             "📡 Config synced to Camera: Laptop IP=%s, Wi-Fi='%s'",
+             currentLaptopIp, currentWifiSsid);
     addLog(netLog);
     if (wifiChanged) {
-      Serial.printf("🔄 Connecting Main ESP32 to new Wi-Fi: '%s'...\n", currentWifiSsid);
+      Serial.printf("🔄 Connecting Main ESP32 to new Wi-Fi: '%s'...\n",
+                    currentWifiSsid);
       WiFi.disconnect();
       WiFi.begin(currentWifiSsid, currentWifiPass);
     }
   } else {
     char logBuf[128];
-    snprintf(logBuf, sizeof(logBuf), "⚙️ Settings updated: Drive=%d TurnL=%d TurnR=%d Thresh=%.0fcm Gain=%d Tol=%.1f°",
-             defaultDriveSpeed, turnLeftSpeed, turnRightSpeed, obstacleThresholdCm, camSteerGain, headingToleranceDeg);
+    snprintf(logBuf, sizeof(logBuf),
+             "⚙️ Settings updated: Drive=%d TurnL=%d TurnR=%d Thresh=%.0fcm "
+             "Gain=%d Tol=%.1f°",
+             defaultDriveSpeed, turnLeftSpeed, turnRightSpeed,
+             obstacleThresholdCm, camSteerGain, headingToleranceDeg);
     addLog(logBuf);
   }
 
@@ -2344,7 +3376,8 @@ void handleSettings() {
 
 // ======================== SETUP ==============================================
 void setup() {
-  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0); // Disable brownout detector to prevent voltage dip reboots
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG,
+                 0); // Disable brownout detector to prevent voltage dip reboots
   Serial.begin(115200);
   delay(1000);
   Serial.println(
@@ -2354,13 +3387,14 @@ void setup() {
   Serial.println(
       F("============================================================"));
 
-  loadSettings(); // Load saved speeds, threshold, gain, and tolerance from EEPROM/NVS
+  loadSettings(); // Load saved speeds, threshold, gain, and tolerance from
+                  // EEPROM/NVS
 
   ESP32PWM::allocateTimer(2);
   ESP32PWM::allocateTimer(3);
   ultrasonicServo.setPeriodHertz(50);
   camServo.setPeriodHertz(50);
-  
+
   // Attach servos and command initial center positions
   writeUltrasonicServo(90);
   writeCamServo(CAM_ANGLE_CENTER);
@@ -2390,7 +3424,8 @@ void setup() {
     Serial.println(F("✅ MPU6050 connected with calibrated offsets"));
   }
 
-  // Configure Wi-Fi in pure Station (STA) Mode on router to eliminate SoftAP radio overhead:
+  // Configure Wi-Fi in pure Station (STA) Mode on router to eliminate SoftAP
+  // radio overhead:
   WiFi.mode(WIFI_STA);
   WiFi.begin(currentWifiSsid, currentWifiPass);
   Serial.printf("Connecting to Wi-Fi '%s'...", currentWifiSsid);
@@ -2402,12 +3437,15 @@ void setup() {
   }
   if (WiFi.status() == WL_CONNECTED) {
     Serial.printf("\n✅ Joined Wi-Fi '%s' — IP: http://%s (Channel: %d)\n",
-                  currentWifiSsid, WiFi.localIP().toString().c_str(), WiFi.channel());
+                  currentWifiSsid, WiFi.localIP().toString().c_str(),
+                  WiFi.channel());
   } else {
-    Serial.println(F("\n⚠️ Wi-Fi router unreachable — activating emergency SoftAP fallback."));
+    Serial.println(F("\n⚠️ Wi-Fi router unreachable — activating emergency "
+                     "SoftAP fallback."));
     WiFi.mode(WIFI_AP_STA);
     WiFi.softAP(AP_SSID, AP_PASSWORD);
-    Serial.printf("⚠️ Emergency SoftAP active: http://%s\n", WiFi.softAPIP().toString().c_str());
+    Serial.printf("⚠️ Emergency SoftAP active: http://%s\n",
+                  WiFi.softAPIP().toString().c_str());
   }
 
   // Start mDNS responder so dashboard is accessible via http://autowaste.local
@@ -2427,7 +3465,8 @@ void setup() {
 
   // Start UDP for peer-to-peer Wi-Fi router messaging with ESP32-CAM
   udp.begin(UDP_MAIN_RX_PORT);
-  Serial.printf("✅ UDP listening on port %d (Target: %d)\n", UDP_MAIN_RX_PORT, UDP_CAM_RX_PORT);
+  Serial.printf("✅ UDP listening on port %d (Target: %d)\n", UDP_MAIN_RX_PORT,
+                UDP_CAM_RX_PORT);
 
   lastSampleUs = micros();
   lastManualCmdMs = millis();
@@ -2437,9 +3476,14 @@ void setup() {
 
   char readyMsg[128];
   if (WiFi.status() == WL_CONNECTED) {
-    snprintf(readyMsg, sizeof(readyMsg), "🚀 System ready! Web Dashboard: http://autowaste.local (or http://%s)", WiFi.localIP().toString().c_str());
+    snprintf(
+        readyMsg, sizeof(readyMsg),
+        "🚀 System ready! Web Dashboard: http://autowaste.local (or http://%s)",
+        WiFi.localIP().toString().c_str());
   } else {
-    snprintf(readyMsg, sizeof(readyMsg), "🚀 System ready! SoftAP: http://autowaste.local (or http://%s)", WiFi.softAPIP().toString().c_str());
+    snprintf(readyMsg, sizeof(readyMsg),
+             "🚀 System ready! SoftAP: http://autowaste.local (or http://%s)",
+             WiFi.softAPIP().toString().c_str());
   }
   addLog(readyMsg);
 }
@@ -2458,21 +3502,9 @@ void loop() {
   if (millis() - lastSensorMs >= 100) {
     lastSensorMs = millis();
     latestDistanceCm = readUltrasonic();
-
-    if (currentMode == MODE_MANUAL && strcmp(currentMotorState, "FORWARD") == 0 &&
-        latestDistanceCm > 0 && latestDistanceCm < obstacleThresholdCm) {
-      stopMotors();
-      char obsBuf[64];
-      snprintf(obsBuf, sizeof(obsBuf), "🚨 [MANUAL SAFETY] Obstacle at %.1f cm!", latestDistanceCm);
-      addLog(obsBuf);
-    }
   }
 
-  if (currentMode == MODE_MANUAL && strcmp(currentMotorState, "STOPPED") != 0 &&
-      millis() - lastManualCmdMs > MANUAL_TIMEOUT_MS) {
-    stopMotors();
-  }
-
+  processManualMode();
   processClassroomAuto();
   processCamGuided();
 }

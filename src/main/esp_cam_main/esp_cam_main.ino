@@ -7,20 +7,22 @@
  *           laptop Python Flask server (with Gemini AI), and transmits state
  *           updates over Wi-Fi UDP broadcast to the Main ESP32 navigation node.
  *
- * Camera Pan Servo: Connected to GPIO 33 on the MAIN ESP32 (controlled via UDP).
+ * Camera Pan Servo: Connected to GPIO 33 on the MAIN ESP32 (controlled via
+ * UDP).
  *
  * Network Configuration:
  *   - Wi-Fi Router : Joins Traffic_ESP (or configured SSID)
- *   - UDP Broadcast: Listens on port 8889, broadcasts to port 8888 (255.255.255.255)
+ *   - UDP Broadcast: Listens on port 8889, broadcasts to port 8888
+ * (255.255.255.255)
  *   - Laptop Server: Sends HTTP POST to http://<laptop_ip>:5000/process_frame
  *
  * Flash Frequency: 80MHz | Flash Mode: QIO | Partition Scheme: Huge APP (3MB)
  * =============================================================================
  */
 
-#include <Arduino.h>
 #include "esp_camera.h"
 #include "secrets.h" // ← Router credentials & UDP ports
+#include <Arduino.h>
 #include <HTTPClient.h>
 #include <Preferences.h>
 #include <WiFi.h>
@@ -56,35 +58,39 @@ bool newWifiPending = false;
 
 // ===================== VISION STATE MACHINE ==================================
 enum VisionState : uint8_t {
-  SCANNING       = 0,
-  TRACKING       = 1,
-  INTERACTION    = 2,
-  RELEASE        = 3,
+  SCANNING = 0,
+  TRACKING = 1,
+  INTERACTION = 2,
+  RELEASE = 3,
   SCAN_STEP_DONE = 4,
   OBSTACLE_CHECK = 5,
-  IS_TARGET      = 6,
-  IS_OBSTACLE    = 7
+  IS_TARGET = 6,
+  IS_OBSTACLE = 7
 };
 
 VisionState visionState = SCANNING;
 unsigned long lastQueryMs = 0;
 unsigned long releaseStartMs = 0;
-uint8_t receivedMode = 0; // 0=MANUAL, 1=AUTONOMOUS, 2=CAM_GUIDED, 3=PAUSED, 5=OBSTACLE_CHECK
+uint8_t receivedMode =
+    0; // 0=MANUAL, 1=AUTONOMOUS, 2=CAM_GUIDED, 3=PAUSED, 5=OBSTACLE_CHECK
 
 // Query intervals
 #define INTERVAL_STABILIZE_MS 4000 // 4 s stabilization after servo movement
-#define INTERVAL_TRACK_MS     2500 // 2.5 s while tracking target
-#define INTERVAL_INTER_MS     3000 // 3.0 s in drop-off interaction
+#define INTERVAL_TRACK_MS 2500     // 2.5 s while tracking target
+#define INTERVAL_INTER_MS 3000     // 3.0 s in drop-off interaction
 
 // ===================== UDP PACKETS (WI-FI ROUTER) ============================
 typedef struct __attribute__((packed)) {
-  uint8_t state;      // 0=SCANNING, 1=TRACKING, 2=INTERACTION, 3=RELEASE, 4=SCAN_STEP_DONE, 5=OBSTACLE_CHECK, 6=IS_TARGET, 7=IS_OBSTACLE
+  uint8_t
+      state; // 0=SCANNING, 1=TRACKING, 2=INTERACTION, 3=RELEASE,
+             // 4=SCAN_STEP_DONE, 5=OBSTACLE_CHECK, 6=IS_TARGET, 7=IS_OBSTACLE
   int8_t angleOffset; // ±30° offset from center
 } CamPacket;
 
 typedef struct __attribute__((packed)) {
-  uint8_t pktType;    // 0=Mode/Heartbeat, 1=Config Sync, 5=Trigger Obstacle Check
-  uint8_t systemMode; // 0=MANUAL, 1=AUTONOMOUS, 2=CAM_GUIDED, 3=PAUSED, 5=OBSTACLE_CHECK
+  uint8_t pktType; // 0=Mode/Heartbeat, 1=Config Sync, 5=Trigger Obstacle Check
+  uint8_t systemMode; // 0=MANUAL, 1=AUTONOMOUS, 2=CAM_GUIDED, 3=PAUSED,
+                      // 5=OBSTACLE_CHECK
   char laptopIp[32];
   char wifiSsid[33];
   char wifiPass[65];
@@ -96,14 +102,16 @@ WiFiUDP udp;
 void sendCamPacket(uint8_t st, int8_t angleOff) {
   outPacket.state = st;
   outPacket.angleOffset = angleOff;
-  
+
   if (WiFi.status() == WL_CONNECTED) {
     udp.beginPacket("255.255.255.255", UDP_MAIN_RX_PORT);
     udp.write((const uint8_t *)&outPacket, sizeof(outPacket));
     udp.endPacket();
 
-    // For critical step transitions, send a 2-packet burst to guarantee delivery
-    if (st == SCAN_STEP_DONE || st == IS_TARGET || st == IS_OBSTACLE || st == TRACKING) {
+    // For critical step transitions, send a 2-packet burst to guarantee
+    // delivery
+    if (st == SCAN_STEP_DONE || st == IS_TARGET || st == IS_OBSTACLE ||
+        st == TRACKING) {
       delay(5);
       udp.beginPacket("255.255.255.255", UDP_MAIN_RX_PORT);
       udp.write((const uint8_t *)&outPacket, sizeof(outPacket));
@@ -119,9 +127,11 @@ String queryLaptopServer(uint8_t state, String &outDetection, int &outBboxX) {
 
   // Flush queued DMA frames from previous angle to ensure 100% fresh live frame
   camera_fb_t *fb = esp_camera_fb_get();
-  if (fb) esp_camera_fb_return(fb);
+  if (fb)
+    esp_camera_fb_return(fb);
   fb = esp_camera_fb_get();
-  if (fb) esp_camera_fb_return(fb);
+  if (fb)
+    esp_camera_fb_return(fb);
 
   // Capture fresh live frame
   fb = esp_camera_fb_get();
@@ -183,16 +193,19 @@ String queryLaptopServer(uint8_t state, String &outDetection, int &outBboxX) {
 }
 
 void handleObstacleCheck() {
-  Serial.println(F("🚨 [OBSTACLE CHECK] Capturing frame to verify obstacle with Gemini..."));
+  Serial.println(F(
+      "🚨 [OBSTACLE CHECK] Capturing frame to verify obstacle with Gemini..."));
   String det = "ERROR";
   int bx = 160;
   queryLaptopServer(OBSTACLE_CHECK, det, bx);
 
-  if (det == "IS_TARGET" || det == "PROXIMITY" || det == "EXTENDED_ARM_WITH_OBJECT" || det == "STOP_PALM") {
+  if (det == "IS_TARGET" || det == "PROXIMITY" ||
+      det == "EXTENDED_ARM_WITH_OBJECT" || det == "STOP_PALM") {
     Serial.println(F("🎯 [OBSTACLE CHECK] Gemini confirmed: IS_TARGET!"));
     sendCamPacket(IS_TARGET, 0);
   } else {
-    Serial.println(F("🚧 [OBSTACLE CHECK] Gemini confirmed: IS_OBSTACLE (or none)."));
+    Serial.println(
+        F("🚧 [OBSTACLE CHECK] Gemini confirmed: IS_OBSTACLE (or none)."));
     sendCamPacket(IS_OBSTACLE, 0);
   }
 }
@@ -232,7 +245,8 @@ void setup() {
   esp_err_t err = esp_camera_init(&cfg);
   if (err != ESP_OK) {
     Serial.printf("❌ Camera init failed: 0x%x\n", err);
-    while (true) delay(1000);
+    while (true)
+      delay(1000);
   }
   Serial.println(F("✅ Camera initialized (320x240 QVGA)"));
 
@@ -245,8 +259,10 @@ void setup() {
     s->set_whitebal(s, 1);
     s->set_awb_gain(s, 1);
     s->set_wb_mode(s, 0);
-    s->set_vflip(s, 1);   // 1 = Flip vertically (corrects upside down camera mount)
-    s->set_hmirror(s, 1); // 1 = Mirror horizontally (maintains correct left/right orientation)
+    s->set_vflip(s,
+                 1); // 1 = Flip vertically (corrects upside down camera mount)
+    s->set_hmirror(s, 1); // 1 = Mirror horizontally (maintains correct
+                          // left/right orientation)
   }
 
   // --- 2. Load Persisted Config from Flash NVS ---
@@ -281,19 +297,23 @@ void setup() {
 
   // --- 4. UDP Init ---
   udp.begin(UDP_CAM_RX_PORT);
-  Serial.printf("✅ UDP listening on port %d (Target: %d)\n", UDP_CAM_RX_PORT, UDP_MAIN_RX_PORT);
+  Serial.printf("✅ UDP listening on port %d (Target: %d)\n", UDP_CAM_RX_PORT,
+                UDP_MAIN_RX_PORT);
 }
 
 // ===================== LOOP =================================================
 unsigned long lastPreviewMs = 0;
 
 void sendPreviewFrame() {
-  if (laptopIp[0] == '\0' || receivedMode != 0) return; // Only preview in manual mode
+  if (laptopIp[0] == '\0' || receivedMode != 0)
+    return; // Only preview in manual mode
 
   camera_fb_t *fb = esp_camera_fb_get();
-  if (fb) esp_camera_fb_return(fb);
+  if (fb)
+    esp_camera_fb_return(fb);
   fb = esp_camera_fb_get();
-  if (!fb) return;
+  if (!fb)
+    return;
 
   String serverUrl = "http://" + String(laptopIp) + ":" + String(LAPTOP_PORT) +
                      "/process_frame?preview=1";
@@ -315,7 +335,8 @@ void loop() {
     MainPacket pkt;
     udp.read((uint8_t *)&pkt, sizeof(pkt));
     receivedMode = pkt.systemMode;
-    Serial.printf("[UDP RX] systemMode=%d, pktType=%d\n", pkt.systemMode, pkt.pktType);
+    Serial.printf("[UDP RX] systemMode=%d, pktType=%d\n", pkt.systemMode,
+                  pkt.pktType);
 
     // Handle trigger for obstacle check from Main ESP32
     if (pkt.pktType == 5 || pkt.systemMode == 5) {
@@ -323,16 +344,39 @@ void loop() {
       return;
     }
 
+    // Handle explicit vision reset command from Main ESP32 (e.g. after 90° turn
+    // / departure / drop-off)
+    if (pkt.pktType == 4) {
+      Serial.println(
+          F("🔄 [UDP RX] Main ESP32 commanded fresh vision scan -> Flushing "
+            "DMA buffers & resetting visionState = SCANNING"));
+      visionState = SCANNING;
+      // Flush DMA buffers to guarantee subsequent capture is 100% fresh from
+      // current heading
+      for (int i = 0; i < 3; i++) {
+        camera_fb_t *fb = esp_camera_fb_get();
+        if (fb)
+          esp_camera_fb_return(fb);
+      }
+      lastQueryMs =
+          millis() - (INTERVAL_STABILIZE_MS -
+                      800); // Wait 800ms for chassis settling then capture
+      return;
+    }
+
     // Process dynamic config sync from Main ESP32 web interface
     if (pkt.pktType == 1 || pkt.laptopIp[0] != '\0') {
-      if (strlen(pkt.laptopIp) >= 7 && strncmp(laptopIp, pkt.laptopIp, sizeof(laptopIp)) != 0) {
+      if (strlen(pkt.laptopIp) >= 7 &&
+          strncmp(laptopIp, pkt.laptopIp, sizeof(laptopIp)) != 0) {
         strncpy(laptopIp, pkt.laptopIp, sizeof(laptopIp));
         camPrefs.begin("cam_cfg", false);
         camPrefs.putString("laptop_ip", laptopIp);
         camPrefs.end();
-        Serial.printf("📡 [NVS] Laptop IP updated from Main ESP32: %s\n", laptopIp);
+        Serial.printf("📡 [NVS] Laptop IP updated from Main ESP32: %s\n",
+                      laptopIp);
       }
-      if (strlen(pkt.wifiSsid) > 0 && strncmp(wifiSsid, pkt.wifiSsid, sizeof(wifiSsid)) != 0) {
+      if (strlen(pkt.wifiSsid) > 0 &&
+          strncmp(wifiSsid, pkt.wifiSsid, sizeof(wifiSsid)) != 0) {
         strncpy(wifiSsid, pkt.wifiSsid, sizeof(wifiSsid));
         strncpy(wifiPass, pkt.wifiPass, sizeof(wifiPass));
         camPrefs.begin("cam_cfg", false);
@@ -340,7 +384,8 @@ void loop() {
         camPrefs.putString("wifi_pass", wifiPass);
         camPrefs.end();
         newWifiPending = true;
-        Serial.printf("📡 [NVS] Wi-Fi SSID updated from Main ESP32: '%s'\n", wifiSsid);
+        Serial.printf("📡 [NVS] Wi-Fi SSID updated from Main ESP32: '%s'\n",
+                      wifiSsid);
       }
     }
   }
@@ -364,11 +409,13 @@ void loop() {
     }
   }
 
-  // Send heartbeat every 2000ms so Main ESP32 Web Dashboard shows ESP32-CAM ONLINE
+  // Send dedicated heartbeat every 2000ms so Main ESP32 Web Dashboard shows
+  // ESP32-CAM ONLINE (Always send state=0 so stale decisions like
+  // SCAN_STEP_DONE are never re-triggered!)
   static unsigned long lastHeartbeatMs = 0;
   if (millis() - lastHeartbeatMs >= 2000) {
     lastHeartbeatMs = millis();
-    sendCamPacket(visionState, 0);
+    sendCamPacket(SCANNING, 0);
   }
 
   // Gentle throttled preview (every 4s) only in MANUAL mode (mode 0)
@@ -394,7 +441,8 @@ void loop() {
     // 1. Wait 4.0 seconds for camera servo to settle & view to stabilize
     if (now - lastQueryMs >= INTERVAL_STABILIZE_MS) {
       lastQueryMs = now;
-      Serial.println(F("📷 [SCAN] Servo stabilized (4s). Capturing & sending frame to Gemini..."));
+      Serial.println(F("📷 [SCAN] Servo stabilized (4s). Capturing & sending "
+                       "frame to Gemini..."));
       String det = "ERROR";
       int bx = 160;
       queryLaptopServer(SCANNING, det, bx);
@@ -405,14 +453,19 @@ void loop() {
         visionState = TRACKING;
         sendCamPacket(TRACKING, offset);
       } else if (det == "NONE") {
-        // Confirmed complete NONE response -> trigger Main ESP32 to step camera servo to next angle immediately!
-        Serial.println(F("⏭️ [SCAN] NONE confirmed. Advancing servo to next angle..."));
+        // Confirmed complete NONE response -> trigger Main ESP32 to step camera
+        // servo to next angle immediately!
+        Serial.println(
+            F("⏭️ [SCAN] NONE confirmed. Advancing servo to next angle..."));
         sendCamPacket(SCAN_STEP_DONE, 0);
         lastQueryMs = millis(); // Reset 4s stabilization timer for next angle
       } else {
-        // HTTP error, incomplete payload, or INVALID -> do NOT advance angle, retry!
-        Serial.println(F("⚠️ [SCAN] Incomplete response / Network glitch. Retrying current angle..."));
-        lastQueryMs = millis() - (INTERVAL_STABILIZE_MS - 1000); // Retry in 1 second
+        // HTTP error, incomplete payload, or INVALID -> do NOT advance angle,
+        // retry!
+        Serial.println(F("⚠️ [SCAN] Incomplete response / Network glitch. "
+                         "Retrying current angle..."));
+        lastQueryMs =
+            millis() - (INTERVAL_STABILIZE_MS - 1000); // Retry in 1 second
       }
     }
     break;
@@ -435,19 +488,23 @@ void loop() {
         releaseStartMs = now;
         sendCamPacket(RELEASE, 0);
       } else if (det == "PROXIMITY") {
-        Serial.println(F("[TRACKING → INTERACTION] Close proximity confirmed."));
+        Serial.println(
+            F("[TRACKING → INTERACTION] Close proximity confirmed."));
         trackMissCount = 0;
         visionState = INTERACTION;
         sendCamPacket(INTERACTION, 0);
-      } else if (det == "EXTENDED_ARM_WITH_OBJECT") {
+      } else if (det == "EXTENDED_ARM_WITH_OBJECT" || det == "TRACKING") {
         trackMissCount = 0;
         int8_t offset = (int8_t)((bx - 160) * 30 / 160);
+        Serial.printf("🎯 [TRACKING ACTIVE] bx=%d, offset=%d°\n", bx, offset);
         sendCamPacket(TRACKING, offset);
       } else if (det == "NONE") {
         trackMissCount++;
-        Serial.printf("[TRACKING] Target not seen (miss %d/3)\n", trackMissCount);
+        Serial.printf("[TRACKING] Target not seen (miss %d/3)\n",
+                      trackMissCount);
         if (trackMissCount >= 3) {
-          Serial.println(F("[TRACKING → SCANNING] Lost target. Restarting scan."));
+          Serial.println(
+              F("[TRACKING → SCANNING] Lost target. Restarting scan."));
           trackMissCount = 0;
           visionState = SCANNING;
           sendCamPacket(SCANNING, 0);
@@ -478,7 +535,8 @@ void loop() {
   // ── 3: RELEASE ─────────────────────────────────────────────────────────
   case RELEASE: {
     if (now - releaseStartMs >= 3000) {
-      Serial.println(F("[RELEASE → SCANNING] Release complete. Restarting scan."));
+      Serial.println(
+          F("[RELEASE → SCANNING] Release complete. Restarting scan."));
       visionState = SCANNING;
       sendCamPacket(SCANNING, 0);
     }

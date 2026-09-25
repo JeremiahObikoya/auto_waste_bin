@@ -11,15 +11,19 @@
 # Chrome debug profile & temporary scraping data
 **/chrome_debug_profile/
 **/debug_frames/
-*.jpg
-*.jpeg
-*.png
-temp_web_frame.jpg
+**/temp_web_frame.jpg
+*.log
+*.tmp
+*.bak
 
 # Python cache & virtual environments
 __pycache__/
 *.py[cod]
 *$py.class
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
 venv/
 .venv/
 env/
