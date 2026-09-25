@@ -7,11 +7,8 @@ This setup connects directly to your **logged-in Google Chrome browser** on `gem
 ## 🚀 How to Run in 3 Easy Steps:
 
 ### 1. Launch Chrome with Remote Debugging
-Double-click [`launch_chrome.bat`](file:///c:/Users/Jeremy/Desktop/SCHOOL%20ACTIVITIES/500%20level/Final_Year_Project/Auto_Waste_Bin/CODE/TEST_WEB_Scrap/launch_chrome.bat) or run in PowerShell:
-```powershell
-cd "c:\Users\Jeremy\Desktop\SCHOOL ACTIVITIES\500 level\Final_Year_Project\Auto_Waste_Bin\CODE\TEST_WEB_Scrap"
-.\launch_chrome.bat
-```
+Double-click [`launch_chrome.bat`](file:///c:/Users/[your_directory]/Auto_Waste_Bin/src/main/launch_chrome.bat)
+
 * A special Chrome window will open to `https://gemini.google.com/app`.
 * **Sign in to your Google / Gemini account** in that window.
 * **Leave that Chrome window open in the background!**
