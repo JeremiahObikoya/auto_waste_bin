@@ -75,7 +75,7 @@ Both servers use the same HTTP contract and can return detections such as:
 
 ### Main controller
 
-- ESP32 Dev Module, 30-pin or 38-pin
+- ESP32 Dev Module, 
 - L298N motor driver
 - Four DC motors
 - HC-SR04-style ultrasonic sensor
